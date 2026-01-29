@@ -96,3 +96,82 @@ def atr(
     tr3 = (low - prev_close).abs()
     true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     return true_range.rolling(window=period).mean()
+
+
+def adx(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    period: int = 14,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """Average Directional Index with Directional Indicators.
+
+    ADX measures TREND STRENGTH (not direction):
+    - ADX > 25: Strong trend (good for trend-following)
+    - ADX 20-25: Trend emerging
+    - ADX < 20: Weak/no trend (ranging market)
+
+    +DI and -DI show trend DIRECTION:
+    - +DI > -DI: Uptrend
+    - -DI > +DI: Downtrend
+
+    Uses Wilder's smoothing (exponential moving average with alpha = 1/period).
+
+    Args:
+        high: High prices.
+        low: Low prices.
+        close: Close prices.
+        period: Lookback period (default 14).
+
+    Returns:
+        Tuple of (adx, plus_di, minus_di) series.
+
+    Example:
+        adx_val, plus_di, minus_di = adx(df['high'], df['low'], df['close'])
+        if adx_val.iloc[-1] > 25 and plus_di.iloc[-1] > minus_di.iloc[-1]:
+            # Strong uptrend
+    """
+    # Calculate True Range
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    # Calculate Directional Movement
+    up_move = high - high.shift(1)
+    down_move = low.shift(1) - low
+
+    # +DM: up move > down move and up move > 0
+    plus_dm = up_move.where((up_move > down_move) & (up_move > 0), 0.0)
+    # -DM: down move > up move and down move > 0
+    minus_dm = down_move.where((down_move > up_move) & (down_move > 0), 0.0)
+
+    # Wilder's smoothing (equivalent to EMA with alpha = 1/period)
+    alpha = 1.0 / period
+
+    # Smoothed True Range
+    smoothed_tr = true_range.ewm(alpha=alpha, adjust=False).mean()
+
+    # Smoothed +DM and -DM
+    smoothed_plus_dm = plus_dm.ewm(alpha=alpha, adjust=False).mean()
+    smoothed_minus_dm = minus_dm.ewm(alpha=alpha, adjust=False).mean()
+
+    # Directional Indicators
+    plus_di = 100 * (smoothed_plus_dm / smoothed_tr)
+    minus_di = 100 * (smoothed_minus_dm / smoothed_tr)
+
+    # Directional Index
+    di_diff = (plus_di - minus_di).abs()
+    di_sum = plus_di + minus_di
+    dx = 100 * (di_diff / di_sum.replace(0, np.nan))
+
+    # ADX = smoothed DX
+    adx_values = dx.ewm(alpha=alpha, adjust=False).mean()
+
+    # Set initial values to NaN
+    adx_values.iloc[: period * 2] = np.nan
+    plus_di.iloc[:period] = np.nan
+    minus_di.iloc[:period] = np.nan
+
+    return adx_values, plus_di, minus_di

@@ -188,3 +188,183 @@ def plot_buy_and_hold_comparison(
     plt.tight_layout()
     plt.savefig(output_path, dpi=120)
     plt.close()
+
+
+def plot_risk_heatmap(
+    risk_by_pair: dict[str, dict],
+    output_path: Path,
+) -> None:
+    """Portfolio risk heat map showing exposure and risk metrics by pair.
+
+    Visual dashboard for monitoring:
+    - Position size exposure
+    - VaR contribution
+    - Current drawdown
+    - Correlation risk
+
+    Color scale: Green = low risk, Red = high risk
+    """
+    if not risk_by_pair:
+        return
+
+    pairs = list(risk_by_pair.keys())
+    metrics = ["exposure_pct", "var_contribution", "drawdown_pct", "volatility"]
+
+    # Build matrix of risk values
+    data = []
+    for pair in pairs:
+        row = []
+        for metric in metrics:
+            val = risk_by_pair[pair].get(metric, 0)
+            row.append(val)
+        data.append(row)
+
+    data = np.array(data)
+
+    fig, ax = plt.subplots(figsize=(10, max(4, len(pairs) * 0.8)))
+
+    # Normalize each column for color mapping
+    with np.errstate(invalid='ignore', divide='ignore'):
+        data_norm = (data - data.min(axis=0)) / (data.max(axis=0) - data.min(axis=0) + 1e-10)
+
+    im = ax.imshow(data_norm, cmap="RdYlGn_r", aspect="auto", vmin=0, vmax=1)
+
+    ax.set_xticks(range(len(metrics)))
+    ax.set_xticklabels(["Exposure", "VaR", "Drawdown", "Volatility"])
+    ax.set_yticks(range(len(pairs)))
+    ax.set_yticklabels(pairs)
+    ax.set_title("Portfolio Risk Heat Map")
+
+    # Add text annotations with actual values
+    for i in range(len(pairs)):
+        for j in range(len(metrics)):
+            val = data[i, j]
+            fmt = f"{val:.1%}" if metrics[j] != "volatility" else f"{val:.2%}"
+            text_color = "white" if data_norm[i, j] > 0.5 else "black"
+            ax.text(j, i, fmt, ha="center", va="center", fontsize=9, color=text_color)
+
+    fig.colorbar(im, label="Risk Level (higher = more risk)")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=120)
+    plt.close()
+
+
+def plot_var_comparison(
+    returns: pd.Series,
+    portfolio_value: float,
+    output_path: Path,
+) -> None:
+    """Compare VaR estimates from different methods.
+
+    Shows historical, parametric, and Monte Carlo VaR side by side.
+    Helps understand model risk - different methods give different answers.
+    """
+    from src.risk.risk_metrics import RiskAnalyzer
+
+    analyzer = RiskAnalyzer()
+    returns_arr = returns.dropna().values
+
+    # Calculate VaR at different confidence levels
+    confidence_levels = [0.90, 0.95, 0.99]
+    methods = ["Historical", "Parametric", "Monte Carlo"]
+
+    results = {method: [] for method in methods}
+    results_cvar = {method: [] for method in methods}
+
+    for conf in confidence_levels:
+        hist = analyzer.historical_var(returns_arr, conf, portfolio_value)
+        param = analyzer.parametric_var(returns_arr, conf, portfolio_value)
+        mc = analyzer.monte_carlo_var(returns_arr, conf, portfolio_value, n_simulations=5000)
+
+        results["Historical"].append(hist.var)
+        results["Parametric"].append(param.var)
+        results["Monte Carlo"].append(mc.var)
+
+        results_cvar["Historical"].append(hist.cvar)
+        results_cvar["Parametric"].append(param.cvar)
+        results_cvar["Monte Carlo"].append(mc.cvar)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # VaR comparison
+    x = np.arange(len(confidence_levels))
+    width = 0.25
+    for i, method in enumerate(methods):
+        ax1.bar(x + i * width, results[method], width, label=method, alpha=0.8)
+
+    ax1.set_xlabel("Confidence Level")
+    ax1.set_ylabel("Value at Risk ($)")
+    ax1.set_title("VaR Comparison by Method")
+    ax1.set_xticks(x + width)
+    ax1.set_xticklabels([f"{int(c*100)}%" for c in confidence_levels])
+    ax1.legend()
+
+    # CVaR comparison
+    for i, method in enumerate(methods):
+        ax2.bar(x + i * width, results_cvar[method], width, label=method, alpha=0.8)
+
+    ax2.set_xlabel("Confidence Level")
+    ax2.set_ylabel("Conditional VaR ($)")
+    ax2.set_title("CVaR (Expected Shortfall) Comparison")
+    ax2.set_xticks(x + width)
+    ax2.set_xticklabels([f"{int(c*100)}%" for c in confidence_levels])
+    ax2.legend()
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=120)
+    plt.close()
+
+
+def plot_circuit_breaker_status(
+    status: dict,
+    output_path: Path,
+) -> None:
+    """Visual gauge showing how close we are to each risk limit.
+
+    Like a car dashboard - shows utilization of each limit.
+    Green = safe, Yellow = caution, Red = near limit.
+    """
+    metrics = [
+        ("Daily Loss", status.get("daily_loss_utilization", 0)),
+        ("Weekly Loss", status.get("weekly_loss_utilization", 0)),
+        ("Drawdown", status.get("drawdown_utilization", 0)),
+        ("Positions", status.get("position_utilization", 0)),
+        ("Pair Exposure", status.get("pair_exposure_utilization", 0)),
+    ]
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    labels = [m[0] for m in metrics]
+    values = [min(m[1], 1.5) for m in metrics]  # Cap at 150% for display
+
+    colors = []
+    for v in values:
+        if v < 0.5:
+            colors.append("green")
+        elif v < 0.8:
+            colors.append("yellow")
+        else:
+            colors.append("red")
+
+    bars = ax.barh(labels, values, color=colors, alpha=0.8, edgecolor="black")
+
+    # Add 100% limit line
+    ax.axvline(1.0, color="red", linestyle="--", linewidth=2, label="Limit")
+
+    # Add percentage labels
+    for bar, val in zip(bars, values):
+        ax.text(bar.get_width() + 0.02, bar.get_y() + bar.get_height() / 2,
+                f"{val:.0%}", va="center", fontsize=10)
+
+    ax.set_xlim(0, 1.5)
+    ax.set_xlabel("Utilization (100% = Limit)")
+    ax.set_title("Risk Limit Utilization Dashboard")
+
+    if status.get("trading_halted"):
+        ax.text(0.5, 0.98, "TRADING HALTED", transform=ax.transAxes,
+                fontsize=14, color="red", fontweight="bold",
+                ha="center", va="top")
+
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=120)
+    plt.close()
