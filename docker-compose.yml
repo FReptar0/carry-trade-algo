@@ -1,0 +1,11 @@
+services:
+  carry-trade:
+    build: .
+    container_name: carry-trade-algo
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./src/news/events_2026.json:/app/src/news/events_2026.json:ro
+    restart: unless-stopped
+    stop_grace_period: 30s

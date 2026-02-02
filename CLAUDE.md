@@ -2,9 +2,9 @@
 
 ## Project Context
 Educational algorithmic trading system focused on forex carry trade strategies.
-**ALL 10 PHASES COMPLETE.**
-Full system: synthetic data, strategy, backtest, optimization, real data, risk management, paper trading, regime detection, multi-timeframe analysis, exit optimization, and validation.
-No real money. No live broker connections. Educational purposes only.
+**ALL 10 PHASES + 5 AUTONOMOUS PHASES (A-E) COMPLETE.**
+Full system: synthetic data, strategy, backtest, optimization, real data, risk management, paper trading, regime detection, multi-timeframe analysis, exit optimization, validation, production operations, adaptive parameters, ML signal filtering, advanced risk management, and RL model lifecycle.
+No real money. Educational purposes only.
 
 ## DFR Location
 Full design & functional requirements: `../dfr.md`
@@ -79,6 +79,30 @@ src/
 │   └── performance.py       - Real-time performance tracking
 ├── visualization/
 │   └── charts.py            - Static result charts
+├── engine/
+│   ├── market_hours.py      - Forex session detection (Sydney→NY)
+│   └── runner.py            - Main trading loop (APScheduler)
+├── news/
+│   ├── calendar.py          - Static economic calendar (JSON)
+│   └── live_calendar.py     - Finnhub live calendar feed
+├── persistence/
+│   └── store.py             - SQLite state persistence
+├── ops/
+│   ├── alerts.py            - Telegram alert manager
+│   ├── watchdog.py          - Heartbeat watchdog
+│   └── reconciler.py        - Broker↔strategy position reconciler
+├── adaptive/
+│   ├── param_store.py       - SQLite param versioning per regime
+│   ├── adaptive_adapter.py  - Runtime param selection by regime
+│   └── optimizer.py         - Optuna Bayesian param optimization
+├── ml/
+│   ├── features.py          - Market feature extraction (10 features)
+│   ├── bandit.py            - LinUCB contextual bandit (TAKE/SKIP)
+│   └── shadow.py            - Shadow evaluation before activation
+├── rl/
+│   ├── environment.py       - Gymnasium RL environment
+│   ├── registry.py          - Model version registry (SQLite)
+│   └── retraining.py        - Bandit retraining pipeline
 └── utils/
     └── logger.py            - Logging configuration
 ```
@@ -212,5 +236,31 @@ src/
   - scripts/run_validation_protocol.py: Full 30-day protocol demo
   - tests/integration/test_paper_trading.py: 22 integration tests
   - 257 tests passing
+- Phase A completed: 2026-02-02
+  - src/broker/oanda.py: OANDA REST API wrapper (orders, positions, candles, swaps)
+  - src/engine/market_hours.py: Forex session detection (Sydney, Tokyo, London, NY)
+  - src/news/calendar.py + live_calendar.py: Static JSON + Finnhub live economic calendar
+  - src/persistence/store.py: SQLite state store (trades, equity, protocol, checkpoints)
+  - src/ops/alerts.py: Telegram alert manager with severity levels
+  - src/ops/watchdog.py: Heartbeat watchdog with alert integration
+  - src/ops/reconciler.py: Broker↔strategy position reconciliation
+  - src/engine/runner.py: APScheduler main loop with graceful shutdown
+- Phase B completed: 2026-02-02
+  - src/adaptive/param_store.py: SQLite-backed parameter versioning per regime
+  - src/adaptive/adaptive_adapter.py: Runtime parameter selection by regime
+  - src/adaptive/optimizer.py: Optuna Bayesian optimization per regime (weekly)
+- Phase C completed: 2026-02-02
+  - src/ml/features.py: 10 market features (RSI, ATR ratio, ADX, vol, spread, etc.)
+  - src/ml/bandit.py: LinUCB contextual bandit for signal gating (TAKE/SKIP)
+  - src/ml/shadow.py: Shadow evaluation — paper-trades before activating
+- Phase D completed: 2026-02-02
+  - src/risk/dynamic_sizer.py: ATR + Kelly + regime + correlation position sizing
+  - src/risk/correlation.py: Rolling pair correlation monitor, portfolio factor
+  - src/risk/scaling.py: ATR-based scale-in/scale-out with profit levels
+- Phase E completed: 2026-02-02
+  - src/rl/environment.py: Gymnasium-compatible TradingEnv
+  - src/rl/registry.py: SQLite model version registry with promote/rollback
+  - src/rl/retraining.py: Bandit retraining pipeline with champion/challenger eval
+  - 473 tests passing, 11 skipped (gymnasium/optimizer optional deps)
 
-PROJECT COMPLETE - All 10 phases implemented and tested.
+PROJECT COMPLETE - All 10 phases + 5 autonomous phases (A-E) implemented and tested.

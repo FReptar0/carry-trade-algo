@@ -16,6 +16,11 @@
 | 8 | Multi-Timeframe Analysis | ✅ Complete | 5/5 |
 | 9 | Exit Optimization | ✅ Complete | 4/4 |
 | 10 | Paper Trading Validation | ✅ Complete | 6/6 |
+| A | Production Operations & Self-Healing | ✅ Complete | 6/6 |
+| B | Adaptive Parameter Optimization | ✅ Complete | 4/4 |
+| C | Contextual Bandit Signal Filter | ✅ Complete | 4/4 |
+| D | Advanced Risk Management | ✅ Complete | 4/4 |
+| E | RL Environment & Model Lifecycle | ✅ Complete | 4/4 |
 
 ---
 
@@ -241,6 +246,73 @@
 
 ---
 
+## Phase A: Production Operations & Self-Healing
+
+**Status:** ✅ Complete
+
+| # | Deliverable | Status | Notes |
+|---|------------|--------|-------|
+| 1 | OANDA broker adapter | ✅ Done | src/broker/oanda.py - REST API wrapper (orders, positions, candles, swaps) |
+| 2 | Market hours engine | ✅ Done | src/engine/market_hours.py - forex session detection (Sydney→NY) |
+| 3 | Economic calendar | ✅ Done | src/news/calendar.py + live_calendar.py - static JSON + Finnhub live feed |
+| 4 | State persistence | ✅ Done | src/persistence/store.py - SQLite for trades, equity, protocol, checkpoints |
+| 5 | Ops components | ✅ Done | alerts.py (Telegram), watchdog.py (heartbeat), reconciler.py (position sync) |
+| 6 | Trading runner | ✅ Done | src/engine/runner.py - APScheduler-based main loop with graceful shutdown |
+
+---
+
+## Phase B: Adaptive Parameter Optimization
+
+**Status:** ✅ Complete
+
+| # | Deliverable | Status | Notes |
+|---|------------|--------|-------|
+| 1 | Parameter store | ✅ Done | src/adaptive/param_store.py - SQLite-backed param versioning per regime |
+| 2 | Adaptive adapter | ✅ Done | src/adaptive/adaptive_adapter.py - runtime param selection by regime |
+| 3 | Optuna optimizer | ✅ Done | src/adaptive/optimizer.py - Bayesian optimization per regime |
+| 4 | Weekly schedule | ✅ Done | Wired into runner (Sunday 00:00 UTC) |
+
+---
+
+## Phase C: Contextual Bandit Signal Filter
+
+**Status:** ✅ Complete
+
+| # | Deliverable | Status | Notes |
+|---|------------|--------|-------|
+| 1 | Feature extractor | ✅ Done | src/ml/features.py - 10 market features (RSI, ATR, ADX, vol, etc.) |
+| 2 | Signal bandit | ✅ Done | src/ml/bandit.py - LinUCB contextual bandit (TAKE/SKIP decisions) |
+| 3 | Shadow evaluator | ✅ Done | src/ml/shadow.py - paper-trades bandit decisions before activating |
+| 4 | Runner integration | ✅ Done | Signal gating + bandit learning on trade outcomes |
+
+---
+
+## Phase D: Advanced Risk Management
+
+**Status:** ✅ Complete
+
+| # | Deliverable | Status | Notes |
+|---|------------|--------|-------|
+| 1 | Dynamic position sizer | ✅ Done | src/risk/dynamic_sizer.py - ATR + Kelly + regime + correlation sizing |
+| 2 | Correlation monitor | ✅ Done | src/risk/correlation.py - rolling pair correlation, portfolio factor |
+| 3 | Scale manager | ✅ Done | src/risk/scaling.py - ATR-based scale-in/scale-out with profit levels |
+| 4 | Runner integration | ✅ Done | Dynamic sizing on entry, scale checks on existing positions |
+
+---
+
+## Phase E: RL Environment & Model Lifecycle
+
+**Status:** ✅ Complete
+
+| # | Deliverable | Status | Notes |
+|---|------------|--------|-------|
+| 1 | RL environment | ✅ Done | src/rl/environment.py - Gymnasium-compatible TradingEnv |
+| 2 | Model registry | ✅ Done | src/rl/registry.py - SQLite versioning with promote/rollback |
+| 3 | Retraining pipeline | ✅ Done | src/rl/retraining.py - bandit retraining + champion/challenger eval |
+| 4 | Weekly schedule | ✅ Done | Wired into runner (Sunday 02:00 UTC) |
+
+---
+
 ## Change Log
 
 | Date | Change |
@@ -256,3 +328,9 @@
 | 2026-01-28 | Phase 8 complete. Multi-timeframe loader, V4 strategy, 23 tests. 209 total tests. |
 | 2026-01-28 | Phase 9 complete. ExitManager with profit-scaled trailing, MAE/MFE analysis, 26 tests. 235 total tests. |
 | 2026-01-29 | Phase 10 complete. Paper trading validation, 30-day protocol, abort conditions, 22 tests. 257 total tests. |
+| 2026-02-02 | Phase A complete. Market hours, economic calendar, state store, OANDA broker, alerts, watchdog, reconciler. |
+| 2026-02-02 | Phase B complete. Param store, adaptive adapter, Optuna-based optimizer. |
+| 2026-02-02 | Phase C complete. Feature extractor, contextual bandit, shadow evaluator. |
+| 2026-02-02 | Phase D complete. Dynamic position sizer, correlation monitor, scale-in/scale-out manager. |
+| 2026-02-02 | Phase E complete. RL environment (Gymnasium), model registry, retraining pipeline. |
+| 2026-02-02 | Runner fully wired. All 473 tests passing, 11 skipped. |
