@@ -44,7 +44,7 @@ class StrategyConfigV3:
     long_ma_period: int = 200      # Long-term trend (proxy for weekly)
 
     # Entry conditions - SIMPLIFIED
-    min_swap_threshold: float = 0.003  # Lower threshold = more opportunities
+    min_swap_threshold: float = 0.0  # Sign-only gate: positive swap = get paid to hold
     max_rsi: int = 75                   # Only avoid extreme overbought
 
     # Risk management - WIDER
@@ -121,7 +121,7 @@ class CarryTradeStrategyV3(Strategy):
                 # Simple conditions - don't over-filter!
 
                 # 1. Positive swap (the carry trade rationale)
-                if swap < self.config.min_swap_threshold:
+                if swap <= 0:
                     continue
 
                 # 2. BOTH MAs trending up (price > short > long)
@@ -225,7 +225,7 @@ class BuyAndHoldStrategy(Strategy):
     Shows what pure carry income would look like.
     """
 
-    def __init__(self, min_swap: float = 0.003) -> None:
+    def __init__(self, min_swap: float = 0.0) -> None:
         self.min_swap = min_swap
 
     def generate_signals(self, data: pd.DataFrame) -> list[TradeSignal]:
@@ -238,7 +238,7 @@ class BuyAndHoldStrategy(Strategy):
         # Find first day with positive swap
         for i in range(50, len(data)):
             swap = data["swap_long"].iloc[i]
-            if swap >= self.min_swap:
+            if swap > 0:
                 signals.append(TradeSignal(
                     timestamp=data["timestamp"].iloc[i],
                     signal=Signal.LONG,

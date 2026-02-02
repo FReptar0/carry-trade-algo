@@ -85,7 +85,6 @@ class RunnerConfig:
         blackout_hours: Hours around events to avoid trading.
         telegram_bot_token: Telegram bot token for alerts.
         telegram_chat_id: Telegram chat ID for alerts.
-        finnhub_api_key: Finnhub API key for live calendar.
         enable_signal_filter: Enable ML signal filtering.
         enable_dynamic_sizing: Enable dynamic position sizing.
         enable_scaling: Enable scale-in/scale-out.
@@ -97,8 +96,8 @@ class RunnerConfig:
     check_interval_minutes: int = 60
     candle_lookback: int = 300
     position_size_units: int = 10000
-    swap_long_default: float = 0.005
-    swap_short_default: float = -0.005
+    swap_long_default: float = 0.00005
+    swap_short_default: float = -0.00005
     initial_equity: float = 100000.0
     log_dir: str = "logs"
     db_path: str = "data/trading.db"
@@ -106,7 +105,6 @@ class RunnerConfig:
     blackout_hours: int = 2
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
-    finnhub_api_key: str = ""
     enable_signal_filter: bool = True
     enable_dynamic_sizing: bool = True
     enable_scaling: bool = True
@@ -214,28 +212,23 @@ class TradingRunner:
         return None
 
     def _init_calendar(self) -> EconomicCalendar:
-        """Initialize calendar, preferring live over static."""
-        api_key = self.config.finnhub_api_key or os.getenv(
-            "FINNHUB_API_KEY", ""
-        )
-        if api_key:
-            try:
-                from src.news.live_calendar import LiveCalendar
+        """Initialize calendar, preferring live feed over static."""
+        try:
+            from src.news.live_calendar import LiveCalendar
 
-                cal = LiveCalendar(
-                    finnhub_api_key=api_key,
-                    fallback_file=self.config.events_file,
-                    blackout_hours=self.config.blackout_hours,
-                )
-                cal.refresh()
-                logger.info("Using LiveCalendar with Finnhub API")
-                return cal
-            except Exception as e:
-                logger.warning(
-                    "Failed to init LiveCalendar: %s, "
-                    "falling back to static",
-                    e,
-                )
+            cal = LiveCalendar(
+                fallback_file=self.config.events_file,
+                blackout_hours=self.config.blackout_hours,
+            )
+            cal.refresh()
+            logger.info("Using LiveCalendar (Forex Factory feed)")
+            return cal
+        except Exception as e:
+            logger.warning(
+                "Failed to init LiveCalendar: %s, "
+                "falling back to static",
+                e,
+            )
 
         return EconomicCalendar(
             self.config.events_file,

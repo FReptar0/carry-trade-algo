@@ -1,14 +1,17 @@
-"""Live economic calendar using Finnhub API.
+"""Live economic calendar using Forex Factory JSON feed.
 
-Replaces static JSON with real-time economic event data from Finnhub.
-Falls back to the static JSON file if the API is unavailable.
-Only tracks high-impact events for currencies relevant to the
-carry trade pairs (USD, JPY, AUD, EUR).
+Fetches real-time economic event data from a free, no-auth JSON feed
+(nfs.faireconomy.media). Falls back to the static JSON file if the
+feed is unavailable. Only tracks high-impact events for currencies
+relevant to the carry trade pairs (USD, JPY, AUD, EUR).
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import urllib.request
+import urllib.error
 from datetime import date, datetime, time, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -16,89 +19,85 @@ from zoneinfo import ZoneInfo
 from src.news.calendar import EconomicCalendar, EconomicEvent
 
 UTC = ZoneInfo("UTC")
+EST = ZoneInfo("America/New_York")
 logger = logging.getLogger(__name__)
 
 RELEVANT_CURRENCIES = {"USD", "JPY", "AUD", "EUR"}
 
+CALENDAR_URL = (
+    "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+)
+
 
 class LiveCalendar(EconomicCalendar):
-    """Economic calendar backed by Finnhub API with static fallback.
+    """Economic calendar backed by Forex Factory feed with static fallback.
 
     Args:
-        finnhub_api_key: API key for Finnhub.
         fallback_file: Path to static JSON events file.
         blackout_hours: Hours around events to consider blackout.
 
     Example:
-        >>> cal = LiveCalendar("your-api-key", "src/news/events_2026.json")
+        >>> cal = LiveCalendar("src/news/events_2026.json")
         >>> cal.refresh()  # Fetch upcoming events
         >>> in_blackout, event = cal.is_blackout_period(datetime.now(UTC))
     """
 
     def __init__(
         self,
-        finnhub_api_key: str,
         fallback_file: str = "src/news/events_2026.json",
         blackout_hours: int = 2,
     ) -> None:
         super().__init__(fallback_file, blackout_hours=blackout_hours)
-        self.finnhub_api_key = finnhub_api_key
         self._fallback_events = list(self.events)
         self._last_refresh: Optional[datetime] = None
 
     def refresh(self) -> int:
-        """Fetch economic events for the next 7 days from Finnhub.
+        """Fetch economic events for this week from Forex Factory feed.
 
         Returns:
             Number of high-impact events found, or -1 on failure.
         """
         try:
-            import finnhub
-
-            client = finnhub.Client(api_key=self.finnhub_api_key)
-
-            from_date = date.today().isoformat()
-            to_date = (date.today() + timedelta(days=7)).isoformat()
-
-            raw = client.calendar_economic(
-                _from=from_date, to=to_date
+            req = urllib.request.Request(
+                CALENDAR_URL,
+                headers={"User-Agent": "carry-trade-bot/1.0"},
             )
-            entries = raw.get("economicCalendar", [])
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                raw = json.loads(resp.read().decode("utf-8"))
 
             new_events: list[EconomicEvent] = []
-            for entry in entries:
+            for entry in raw:
                 impact = entry.get("impact", "").lower()
-                country = entry.get("country", "").upper()
-                currency = self._country_to_currency(country)
+                currency = entry.get("country", "").upper()
 
                 if impact != "high":
                     continue
                 if currency not in RELEVANT_CURRENCIES:
                     continue
 
-                event_date = entry.get("date", "")
-                event_time = entry.get("time", "00:00")
+                date_str = entry.get("date", "")
+                if not date_str:
+                    continue
 
                 try:
-                    d = date.fromisoformat(event_date)
-                    parts = event_time.split(":")
-                    t = time(int(parts[0]), int(parts[1]))
-                except (ValueError, IndexError):
+                    # Dates are in EST (e.g. "2026-02-02T10:00:00-05:00")
+                    dt_est = datetime.fromisoformat(date_str)
+                    dt_utc = dt_est.astimezone(UTC)
+                except (ValueError, TypeError):
                     continue
 
                 new_events.append(
                     EconomicEvent(
-                        date=d,
-                        time_utc=t,
-                        name=entry.get("event", "Unknown"),
+                        date=dt_utc.date(),
+                        time_utc=dt_utc.time().replace(tzinfo=None),
+                        name=entry.get("title", "Unknown"),
                         currency=currency,
                         impact="high",
                     )
                 )
 
             if new_events:
-                # Merge with existing events (keep static events
-                # that are still in the future)
+                # Merge with static events still in the future
                 now = datetime.now(UTC)
                 existing_future = [
                     e
@@ -118,49 +117,24 @@ class LiveCalendar(EconomicCalendar):
                 )
                 self._last_refresh = now
                 logger.info(
-                    "LiveCalendar refreshed: %d events",
+                    "LiveCalendar refreshed: %d high-impact events",
                     len(new_events),
                 )
                 return len(new_events)
 
             logger.warning(
-                "No high-impact events from Finnhub, "
-                "keeping fallback"
+                "No high-impact events from feed, keeping fallback"
             )
             return 0
 
-        except ImportError:
-            logger.warning(
-                "finnhub-python not installed, using fallback calendar"
-            )
-            return -1
         except Exception as e:
             logger.error(
-                "Failed to fetch Finnhub calendar: %s. "
-                "Using fallback.",
+                "Failed to fetch calendar feed: %s. Using fallback.",
                 e,
             )
             return -1
 
     @property
     def last_refresh(self) -> Optional[datetime]:
-        """When the calendar was last refreshed from API."""
+        """When the calendar was last refreshed from the feed."""
         return self._last_refresh
-
-    @staticmethod
-    def _country_to_currency(country: str) -> str:
-        """Map Finnhub country codes to currency codes."""
-        mapping = {
-            "US": "USD",
-            "JP": "JPY",
-            "AU": "AUD",
-            "EU": "EUR",
-            "DE": "EUR",
-            "FR": "EUR",
-            "IT": "EUR",
-            "GB": "GBP",
-            "CA": "CAD",
-            "NZ": "NZD",
-            "CH": "CHF",
-        }
-        return mapping.get(country, country)
