@@ -44,8 +44,9 @@ from apscheduler.triggers.cron import CronTrigger
 from src.broker.oanda import OandaBroker
 from src.broker.orders import OrderSide
 from src.engine.market_hours import ForexMarketHours
+from src.data.cross_asset import CrossAssetFetcher
 from src.ml.bandit import SignalBandit
-from src.ml.features import FeatureExtractor
+from src.ml.features import FEATURE_NAMES, FeatureExtractor
 from src.ml.shadow import ShadowEvaluator
 from src.monitoring.performance import PerformanceMonitor, TradeRecord
 from src.news.calendar import EconomicCalendar
@@ -155,8 +156,11 @@ class TradingRunner:
         self._adaptive_adapter = None
 
         # Phase C: Signal filter
-        self.feature_extractor = FeatureExtractor()
-        self.bandit = SignalBandit(n_features=10)
+        self._cross_asset_fetcher = CrossAssetFetcher(cache_ttl=300)
+        self.feature_extractor = FeatureExtractor(
+            cross_asset_fetcher=self._cross_asset_fetcher
+        )
+        self.bandit = SignalBandit(n_features=len(FEATURE_NAMES))
         self.shadow_evaluator = ShadowEvaluator(
             min_trades=50, min_advantage=0.1
         )
@@ -244,6 +248,18 @@ class TradingRunner:
             active = registry.get_active("bandit_v1")
             if active:
                 self.bandit.load(active.artifact_path)
+                # Guard: reinitialize if loaded model has wrong n_features
+                if self.bandit.n_features != len(FEATURE_NAMES):
+                    logger.warning(
+                        "Bandit n_features mismatch (%d vs %d), "
+                        "reinitializing",
+                        self.bandit.n_features,
+                        len(FEATURE_NAMES),
+                    )
+                    self.bandit = SignalBandit(
+                        n_features=len(FEATURE_NAMES)
+                    )
+                    return
                 self._bandit_active = True
                 logger.info(
                     "Loaded active bandit model v%d",

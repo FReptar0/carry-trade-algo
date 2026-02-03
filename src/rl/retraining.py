@@ -48,7 +48,7 @@ class RetrainingPipeline:
     def retrain_bandit(
         self,
         recent_trades: list[dict],
-        n_features: int = 10,
+        n_features: int = 14,
     ) -> Optional[int]:
         """Retrain the contextual bandit on recent trade data.
 

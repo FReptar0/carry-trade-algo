@@ -3,7 +3,9 @@
 import numpy as np
 import pandas as pd
 import pytest
+from unittest.mock import MagicMock
 
+from src.data.cross_asset import CrossAssetData
 from src.ml.features import FeatureExtractor, FEATURE_NAMES
 
 
@@ -72,3 +74,41 @@ class TestFeatureExtractor:
         extractor = FeatureExtractor()
         features = extractor.extract(sample_df, "USD/JPY")
         assert features["swap_rate"] == 0.005
+
+    def test_default_cross_asset_values_no_fetcher(self, sample_df):
+        """Without a fetcher, cross-asset features use defaults."""
+        extractor = FeatureExtractor()
+        features = extractor.extract(sample_df, "USD/JPY")
+        assert features["vix"] == 20.0
+        assert features["dxy"] == 100.0
+        assert features["us10y_yield"] == 4.0
+        assert features["sp500_change_pct"] == 0.0
+
+    def test_cross_asset_values_with_mock_fetcher(self, sample_df):
+        """With a fetcher, cross-asset features come from fetcher data."""
+        mock_fetcher = MagicMock()
+        mock_fetcher.get.return_value = CrossAssetData(
+            vix=25.0,
+            dxy=105.0,
+            us10y=4.5,
+            sp500=5200.0,
+            sp500_prev_close=5100.0,
+            fetched_at=0.0,
+            is_default=False,
+        )
+        extractor = FeatureExtractor(cross_asset_fetcher=mock_fetcher)
+        features = extractor.extract(sample_df, "USD/JPY")
+        assert features["vix"] == 25.0
+        assert features["dxy"] == 105.0
+        assert features["us10y_yield"] == 4.5
+        # (5200 - 5100) / 5100 * 100 ≈ 1.9608
+        assert abs(features["sp500_change_pct"] - 100 / 5100 * 100) < 0.01
+
+    def test_feature_count_is_14(self):
+        assert len(FEATURE_NAMES) == 14
+
+    def test_to_array_returns_shape_14(self, sample_df):
+        extractor = FeatureExtractor()
+        features = extractor.extract(sample_df, "USD/JPY")
+        arr = extractor.to_array(features)
+        assert arr.shape == (14,)

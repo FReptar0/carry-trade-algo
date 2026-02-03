@@ -33,7 +33,7 @@ class SignalBandit:
         prior_strength: Prior precision (higher = more conservative).
 
     Example:
-        >>> bandit = SignalBandit(n_features=10)
+        >>> bandit = SignalBandit(n_features=14)
         >>> action, confidence = bandit.decide(features)
         >>> # After trade outcome:
         >>> bandit.update(features, "TAKE", reward=0.5)
@@ -41,7 +41,7 @@ class SignalBandit:
 
     def __init__(
         self,
-        n_features: int = 10,
+        n_features: int = 14,
         prior_strength: float = 1.0,
     ) -> None:
         self.n_features = n_features

@@ -28,17 +28,28 @@ FEATURE_NAMES = [
     "regime_code",
     "swap_rate",
     "spread_bps",
+    "vix",
+    "dxy",
+    "us10y_yield",
+    "sp500_change_pct",
 ]
 
 
 class FeatureExtractor:
     """Extracts context features from candle data.
 
+    Args:
+        cross_asset_fetcher: Optional CrossAssetFetcher for macro data.
+            If None, cross-asset features use defaults.
+
     Example:
         >>> extractor = FeatureExtractor()
         >>> features = extractor.extract(df, "USD/JPY")
         >>> print(features["rsi_14"])
     """
+
+    def __init__(self, cross_asset_fetcher=None) -> None:
+        self._cross_asset_fetcher = cross_asset_fetcher
 
     def extract(
         self, df: pd.DataFrame, pair: str
@@ -113,7 +124,7 @@ class FeatureExtractor:
         else:
             regime_code = 3
 
-        return {
+        features = {
             "rsi_14": rsi_14,
             "atr_ratio": atr_ratio,
             "ma_spread": ma_spread,
@@ -124,6 +135,39 @@ class FeatureExtractor:
             "regime_code": float(regime_code),
             "swap_rate": swap_rate,
             "spread_bps": spread_bps,
+        }
+        features.update(self._cross_asset_features())
+        return features
+
+    def _cross_asset_features(self) -> dict[str, float]:
+        """Return cross-asset macro features.
+
+        Uses the fetcher if available, otherwise returns defaults.
+        """
+        if self._cross_asset_fetcher is not None:
+            try:
+                data = self._cross_asset_fetcher.get()
+                sp500_chg = (
+                    (data.sp500 - data.sp500_prev_close)
+                    / data.sp500_prev_close
+                    * 100.0
+                    if data.sp500_prev_close > 0
+                    else 0.0
+                )
+                return {
+                    "vix": data.vix,
+                    "dxy": data.dxy,
+                    "us10y_yield": data.us10y,
+                    "sp500_change_pct": sp500_chg,
+                }
+            except Exception as e:
+                logger.debug("Cross-asset fetch failed: %s", e)
+
+        return {
+            "vix": 20.0,
+            "dxy": 100.0,
+            "us10y_yield": 4.0,
+            "sp500_change_pct": 0.0,
         }
 
     def to_array(self, features: dict[str, float]) -> np.ndarray:

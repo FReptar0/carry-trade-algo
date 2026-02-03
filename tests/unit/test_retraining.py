@@ -30,7 +30,7 @@ def sample_trades():
     for _ in range(30):
         trades.append(
             {
-                "features": np.random.randn(10).tolist(),
+                "features": np.random.randn(14).tolist(),
                 "action": "TAKE",
                 "pnl": np.random.randn() * 100,
             }
