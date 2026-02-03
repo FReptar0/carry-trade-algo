@@ -74,7 +74,7 @@ class RiskLimits:
     max_daily_loss_pct: float = 0.03  # 3% daily loss limit
     max_weekly_loss_pct: float = 0.07  # 7% weekly loss limit
     max_drawdown_pct: float = 0.20  # 20% maximum drawdown
-    max_positions: int = 3  # Maximum simultaneous positions
+    max_positions: int = 6  # Maximum simultaneous positions
     max_exposure_per_pair_pct: float = 0.15  # 15% max in one pair
     close_positions_on_breach: bool = False  # Auto-close on breach?
     cooldown_hours: int = 24  # Hours to wait before re-enabling trading

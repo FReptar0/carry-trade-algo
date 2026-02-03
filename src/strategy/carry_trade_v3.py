@@ -54,8 +54,8 @@ class StrategyConfigV3:
     trailing_atr_mult: float = 2.0  # Trail by 2x ATR
 
     # Position sizing
-    position_size_pct: float = 0.08  # Slightly smaller since we hold longer
-    max_positions: int = 2
+    position_size_pct: float = 0.04  # Smaller per position with 6 pairs
+    max_positions: int = 6
 
 
 class CarryTradeStrategyV3(Strategy):
@@ -136,7 +136,7 @@ class CarryTradeStrategyV3(Strategy):
                 golden_cross = (prev_short_ma <= prev_long_ma and
                                current_short_ma > current_long_ma)
                 strong_uptrend = (current_short_ma > current_long_ma and
-                                 price > current_short_ma * 1.01)  # Price 1% above short MA
+                                 price > current_short_ma * 1.003)  # Price 0.3% above short MA
 
                 if golden_cross or strong_uptrend:
                     in_position = True
