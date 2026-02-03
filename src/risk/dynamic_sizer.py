@@ -5,6 +5,7 @@ Replaces fixed position_size_units with adaptive sizing that considers:
 2. Volatility adjustment (scale inversely with realized vol)
 3. Regime multiplier from the adapter
 4. Correlation factor (reduce when positions are correlated)
+5. Drawdown scalar (quadratic decay as drawdown increases)
 """
 
 from __future__ import annotations
@@ -27,6 +28,8 @@ class DynamicSizer:
         target_vol: Target annualized volatility for sizing.
         min_units: Floor for position size.
         max_units: Ceiling for position size.
+        max_drawdown_pct: Maximum drawdown before circuit breaker (0-1).
+        drawdown_floor: Minimum scaling factor at max drawdown.
 
     Example:
         >>> sizer = DynamicSizer(base_units=10000)
@@ -45,12 +48,35 @@ class DynamicSizer:
         target_vol: float = 0.10,
         min_units: int = DEFAULT_MIN_UNITS,
         max_units: int = DEFAULT_MAX_UNITS,
+        max_drawdown_pct: float = 0.20,
+        drawdown_floor: float = 0.25,
     ) -> None:
         self.base_units = base_units
         self.max_portfolio_risk_pct = max_portfolio_risk_pct
         self.target_vol = target_vol
         self.min_units = min_units
         self.max_units = max_units
+        self.max_drawdown_pct = max_drawdown_pct
+        self.drawdown_floor = drawdown_floor
+
+    def drawdown_scalar(self, drawdown_pct: float) -> float:
+        """Quadratic decay factor based on current drawdown.
+
+        Smoothly reduces position size as drawdown increases, reaching
+        the floor at max_drawdown_pct. Quadratic decay is gentle for
+        small drawdowns but drops fast near the limit.
+
+        Args:
+            drawdown_pct: Current drawdown as a fraction (0-1).
+
+        Returns:
+            Scaling factor between drawdown_floor and 1.0.
+        """
+        clamped = min(max(drawdown_pct, 0.0), self.max_drawdown_pct)
+        return max(
+            self.drawdown_floor,
+            1.0 - (clamped / self.max_drawdown_pct) ** 2,
+        )
 
     def calculate_size(
         self,
@@ -63,6 +89,7 @@ class DynamicSizer:
         avg_loss: float,
         regime_mult: float = 1.0,
         correlation_factor: float = 1.0,
+        drawdown_pct: float = 0.0,
     ) -> int:
         """Calculate position size in units.
 
@@ -76,6 +103,7 @@ class DynamicSizer:
             avg_loss: Average losing trade P&L (positive number).
             regime_mult: Position size multiplier from regime adapter.
             correlation_factor: 0.5-1.0, lower = more correlated.
+            drawdown_pct: Current portfolio drawdown (0-1).
 
         Returns:
             Position size in units (integer).
@@ -107,20 +135,24 @@ class DynamicSizer:
         kelly_units = int(equity * half_kelly / price) if price > 0 else self.base_units
         raw_units = min(kelly_units, risk_units)
 
-        # 5. Apply multipliers
-        adjusted = int(raw_units * vol_scale * regime_mult * correlation_factor)
+        # 5. Apply multipliers (including drawdown scalar)
+        dd_factor = self.drawdown_scalar(drawdown_pct)
+        adjusted = int(
+            raw_units * vol_scale * regime_mult * correlation_factor * dd_factor
+        )
 
         # 6. Clamp
         result = max(self.min_units, min(adjusted, self.max_units))
 
         logger.debug(
             "DynamicSizer %s: kelly=%.3f vol_scale=%.2f "
-            "regime=%.2f corr=%.2f -> %d units",
+            "regime=%.2f corr=%.2f dd=%.2f -> %d units",
             pair,
             half_kelly,
             vol_scale,
             regime_mult,
             correlation_factor,
+            dd_factor,
             result,
         )
         return result

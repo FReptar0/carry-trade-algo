@@ -239,7 +239,7 @@ src/
 - Phase A completed: 2026-02-02
   - src/broker/oanda.py: OANDA REST API wrapper (orders, positions, candles, swaps)
   - src/engine/market_hours.py: Forex session detection (Sydney, Tokyo, London, NY)
-  - src/news/calendar.py + live_calendar.py: Static JSON + Finnhub live economic calendar
+  - src/news/calendar.py + live_calendar.py: Static JSON + Forex Factory live economic calendar (free, no API key)
   - src/persistence/store.py: SQLite state store (trades, equity, protocol, checkpoints)
   - src/ops/alerts.py: Telegram alert manager with severity levels
   - src/ops/watchdog.py: Heartbeat watchdog with alert integration
@@ -264,3 +264,48 @@ src/
   - 473 tests passing, 11 skipped (gymnasium/optimizer optional deps)
 
 PROJECT COMPLETE - All 10 phases + 5 autonomous phases (A-E) implemented and tested.
+
+## Post-Launch Changes (Live Trading)
+
+- **2026-02-02: Swap rate scale mismatch fix**
+  - V3 swap gate changed from `swap >= 0.003` to `swap > 0` (sign-only)
+  - Runner fallback swap defaults 0.005 → 0.00005 (OANDA daily scale)
+  - Root cause: synthetic generator scaled rates ×100, OANDA returns raw daily rates
+  - Live calendar: replaced paid Finnhub API with free Forex Factory JSON feed (nfs.faireconomy.media)
+  - Removed finnhub_api_key from runner config entirely
+  - 472 tests passing
+
+- **2026-02-02: Strong uptrend threshold tuned**
+  - Entry threshold: price > 50MA × 1.01 → price > 50MA × 1.003 (0.3%)
+  - Allows re-entry after golden cross is consumed in lookback window
+  - AUD/JPY opened first live trade at 108.156
+
+- **2026-02-03: Multi-pair expansion**
+  - Added GBP/JPY, NZD/JPY, EUR/JPY, CAD/JPY (6 pairs total)
+  - V3 max_positions 2 → 6, position_size_pct 8% → 4%
+  - Circuit breaker max_positions 3 → 6
+  - GBP/JPY opened at 212.630 (golden cross), NZD/JPY at 93.522 (strong uptrend)
+  - EUR/JPY, CAD/JPY, USD/JPY monitoring — MAs not yet aligned
+
+- **Live positions as of 2026-02-03:**
+  - AUD/JPY: 1,000 units @ 108.156
+  - GBP/JPY: 1,000 units @ 212.630
+  - NZD/JPY: 1,000 units @ 93.522
+
+- **Credentials (.env, gitignored):**
+  - OANDA practice account configured and connected
+  - Telegram alerts active (bot token + chat ID)
+  - FMP_API_KEY stored (free tier, stock data only — economic calendar is paid)
+  - Forex Factory calendar: free, no key needed
+
+- **2026-02-02: Drawdown-aware position sizing**
+  - DynamicSizer: quadratic decay `factor = max(0.25, 1.0 - (dd/0.20)^2)`
+  - Smoothly reduces new position size: 0% DD → 1.0, 10% DD → 0.75, 20% DD → 0.25 (floor)
+  - Circuit breaker unchanged (still halts at 20%), this adds a layer before it
+  - Runner passes `snapshot.drawdown` to `calculate_size()` — existing positions unaffected
+  - 6 new tests, 490 total passing
+
+- **Enhancement roadmap:** see docs/ENHANCEMENTS.md
+  - Phase 1 (best to have): Multi-pair ✅, limit orders, drawdown-aware rebalancing ✅, continuous vol scaling
+  - Phase 2 (nice to have): Cross-asset signals, time-of-day seasonality, sentiment data, multi-TF refinement
+  - Phase 3 (future): Short-side carry, ensemble strategies, deep RL, macro event model

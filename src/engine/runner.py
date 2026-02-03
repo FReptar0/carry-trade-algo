@@ -714,6 +714,7 @@ class TradingRunner:
                 avg_loss=avg_loss if avg_loss > 0 else 100.0,
                 regime_mult=1.0,
                 correlation_factor=corr_factor,
+                drawdown_pct=stats.drawdown,
             )
         else:
             units = self.config.position_size_units
