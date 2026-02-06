@@ -378,6 +378,26 @@ class TradingRunner:
             max_instances=1,
         )
 
+        # Daily report (22:00 UTC, after rollover)
+        self.scheduler.add_job(
+            self._send_daily_report,
+            CronTrigger(hour=22, minute=0, timezone=UTC),
+            id="daily_report",
+            name="Daily performance report",
+            max_instances=1,
+        )
+
+        # Weekly report (Sunday 08:00 UTC)
+        self.scheduler.add_job(
+            self._send_weekly_report,
+            CronTrigger(
+                day_of_week="sun", hour=8, minute=0, timezone=UTC
+            ),
+            id="weekly_report",
+            name="Weekly performance report",
+            max_instances=1,
+        )
+
         # Run initial tick
         self._tick()
 
@@ -1250,3 +1270,74 @@ class TradingRunner:
 
         except Exception as e:
             logger.error("Weekly retraining failed: %s", e)
+
+    def _send_daily_report(self) -> None:
+        """Send daily performance report via Telegram."""
+        logger.info("Generating daily report")
+        try:
+            from scripts.generate_report import (
+                get_db_connection,
+                get_daily_report,
+                get_protocol_progress,
+                format_daily_report,
+            )
+
+            conn = get_db_connection(self.config.db_path)
+            report = get_daily_report(conn)
+            progress = get_protocol_progress(conn)
+            conn.close()
+
+            if not report:
+                logger.warning("No daily report data available")
+                return
+
+            positions = self.broker.get_all_positions() or []
+            account = self.broker.get_account_state() or {}
+
+            report.open_positions = len(positions)
+            report.unrealized_pnl = sum(
+                p.get("unrealized_pnl", 0) for p in positions
+            )
+
+            msg = format_daily_report(report, positions, account, progress)
+
+            if self.alert_manager:
+                self.alert_manager.send("INFO", "Daily Report", msg)
+                logger.info("Daily report sent")
+            else:
+                logger.info("Daily report (no Telegram):\n%s", msg)
+
+        except Exception as e:
+            logger.error("Failed to send daily report: %s", e)
+
+    def _send_weekly_report(self) -> None:
+        """Send weekly performance report via Telegram."""
+        logger.info("Generating weekly report")
+        try:
+            from scripts.generate_report import (
+                get_db_connection,
+                get_weekly_report,
+                get_protocol_progress,
+                format_weekly_report,
+            )
+
+            conn = get_db_connection(self.config.db_path)
+            report = get_weekly_report(conn)
+            progress = get_protocol_progress(conn)
+            conn.close()
+
+            if not report:
+                logger.warning("No weekly report data available")
+                return
+
+            account = self.broker.get_account_state() or {}
+            msg = format_weekly_report(report, progress, account)
+
+            if self.alert_manager:
+                self.alert_manager.send("INFO", "Weekly Report", msg)
+                logger.info("Weekly report sent")
+            else:
+                logger.info("Weekly report (no Telegram):\n%s", msg)
+
+        except Exception as e:
+            logger.error("Failed to send weekly report: %s", e)
