@@ -145,10 +145,14 @@ class TradingRunner:
         self.watchdog = Watchdog(
             expected_interval_sec=self.config.check_interval_minutes * 60,
             alert_manager=self.alert_manager,
+            market_open_check=lambda: ForexMarketHours.is_market_open(
+                datetime.now(UTC)
+            ),
         )
         self.reconciler = Reconciler(
             alert_manager=self.alert_manager
         )
+        self._last_market_state: bool = True  # Track market open/close
         self.calendar = self._init_calendar()
 
         # Phase B: Adaptive parameters (loaded lazily)
@@ -1168,6 +1172,58 @@ class TradingRunner:
             self.protocol.duration,
             progress["status"],
         )
+
+        # Check for market open/close transitions
+        self._check_market_transition()
+
+    def _check_market_transition(self) -> None:
+        """Check if market just opened or closed and send notification."""
+        now = datetime.now(UTC)
+        market_open = ForexMarketHours.is_market_open(now)
+
+        if market_open and not self._last_market_state:
+            # Market just opened
+            next_close = ForexMarketHours.next_close(now)
+            if self.alert_manager:
+                positions = self.broker.get_all_positions() or []
+                acct = self.broker.get_account_state() or {}
+                pos_summary = "\n".join(
+                    f"  {p['pair']}: {p['units']}u, PnL: ${p['unrealized_pnl']:.2f}"
+                    for p in positions
+                ) if positions else "  No open positions"
+
+                self.alert_manager.send(
+                    "INFO",
+                    "Market Opened",
+                    f"Forex market is now OPEN\n\n"
+                    f"Equity: ${acct.get('equity', 0):,.2f}\n"
+                    f"Open Positions:\n{pos_summary}\n\n"
+                    f"Next close: {next_close.strftime('%a %b %d %H:%M UTC')}",
+                )
+            logger.info("Market opened - trading resumed")
+
+        elif not market_open and self._last_market_state:
+            # Market just closed
+            next_open = ForexMarketHours.next_open(now)
+            if self.alert_manager:
+                positions = self.broker.get_all_positions() or []
+                acct = self.broker.get_account_state() or {}
+                pos_summary = "\n".join(
+                    f"  {p['pair']}: {p['units']}u, PnL: ${p['unrealized_pnl']:.2f}"
+                    for p in positions
+                ) if positions else "  No open positions"
+
+                self.alert_manager.send(
+                    "INFO",
+                    "Market Closed",
+                    f"Forex market is now CLOSED\n\n"
+                    f"Weekend Equity: ${acct.get('equity', 0):,.2f}\n"
+                    f"Positions held over weekend:\n{pos_summary}\n\n"
+                    f"Next open: {next_open.strftime('%a %b %d %H:%M UTC')}",
+                )
+            logger.info("Market closed - trading paused until %s", next_open)
+
+        self._last_market_state = market_open
 
     def _weekly_optimization(self) -> None:
         """Run weekly parameter optimization (Sunday 00:00 UTC)."""
