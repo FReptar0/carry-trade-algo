@@ -801,6 +801,12 @@ class TradingRunner:
         # Track last tick time for /health command
         self._last_tick_time = now
 
+        # Persist position state to SQLite for restart recovery
+        try:
+            self.store.save_positions(self._strategy_positions)
+        except Exception:
+            logger.warning("Failed to persist position states", exc_info=True)
+
     def _process_pair(
         self,
         pair: str,
@@ -1376,6 +1382,14 @@ class TradingRunner:
                         pair,
                     )
                     self._strategy_positions.pop(pair, None)
+                    try:
+                        self.store.delete_position(pair)
+                    except Exception:
+                        logger.warning(
+                            "Failed to delete ghost position %s from store",
+                            pair,
+                            exc_info=True,
+                        )
             return
 
         exit_price = order.avg_fill_price
@@ -1393,6 +1407,14 @@ class TradingRunner:
         del self._strategy_positions[pair]
         self._exit_managers.pop(pair, None)  # Clean up ExitManager state
         self._trades_closed_today += 1
+
+        # Remove persisted state so stale data is not restored on restart
+        try:
+            self.store.delete_position(pair)
+        except Exception:
+            logger.warning(
+                "Failed to delete position %s from store", pair, exc_info=True
+            )
 
         # Phase C: Update bandit with trade outcome
         if self.config.enable_signal_filter and entry_info:
@@ -2045,6 +2067,85 @@ class TradingRunner:
                 if pos.get("entry_atr") is None:
                     pos["entry_atr"] = atr_est
             logger.debug("ExitManager initialized for %s", pair)
+
+        # ----- Restore persisted metadata from SQLite -----
+        try:
+            persisted = self.store.load_positions()
+        except Exception:
+            logger.warning("Failed to load persisted position states", exc_info=True)
+            persisted = {}
+
+        _PERSIST_FIELDS = {
+            "high_water_mark",
+            "entry_atr",
+            "original_units",
+            "tranche_count",
+            "levels_taken",
+            "low_water_mark",
+            "last_vol_trim_time",
+            "financing",
+        }
+
+        for pair, pos in self._strategy_positions.items():
+            saved = persisted.get(pair)
+            if saved is None:
+                continue
+
+            restored: list[str] = []
+
+            # high_water_mark: keep persisted only if it exceeds current
+            if saved.get("high_water_mark") is not None:
+                saved_hwm = saved["high_water_mark"]
+                if saved_hwm > pos.get("high_water_mark", 0):
+                    pos["high_water_mark"] = saved_hwm
+                    restored.append(f"hwm={saved_hwm:.5f}")
+
+            # low_water_mark: keep persisted only if it is lower
+            if saved.get("low_water_mark") is not None:
+                saved_lwm = saved["low_water_mark"]
+                current_lwm = pos.get("low_water_mark", float("inf"))
+                if saved_lwm < current_lwm:
+                    pos["low_water_mark"] = saved_lwm
+                    restored.append(f"lwm={saved_lwm:.5f}")
+
+            # entry_atr: persisted wins over estimated value
+            if saved.get("entry_atr") is not None:
+                pos["entry_atr"] = saved["entry_atr"]
+                restored.append(f"entry_atr={saved['entry_atr']:.5f}")
+
+            # original_units: persisted wins (OANDA only has current units)
+            if saved.get("original_units") is not None:
+                pos["original_units"] = saved["original_units"]
+                restored.append(f"original_units={saved['original_units']}")
+
+            # tranche_count: persisted wins
+            if saved.get("tranche_count") is not None:
+                pos["tranche_count"] = saved["tranche_count"]
+                restored.append(f"tranche_count={saved['tranche_count']}")
+
+            # levels_taken: persisted wins
+            if saved.get("levels_taken") is not None:
+                pos["levels_taken"] = saved["levels_taken"]
+                restored.append(f"levels_taken={saved['levels_taken']}")
+
+            # last_vol_trim_time: persisted wins
+            if saved.get("last_vol_trim_time") is not None:
+                pos["last_vol_trim_time"] = saved["last_vol_trim_time"]
+                restored.append("last_vol_trim_time=restored")
+
+            # financing: persisted wins only if current is 0 and persisted > 0
+            saved_fin = saved.get("financing", 0.0)
+            current_fin = pos.get("financing", 0.0)
+            if saved_fin and not current_fin:
+                pos["financing"] = saved_fin
+                restored.append(f"financing={saved_fin:.4f}")
+
+            if restored:
+                logger.info(
+                    "Position %s restored from SQLite: %s",
+                    pair,
+                    ", ".join(restored),
+                )
 
     def _attach_initial_stop(self, pair: str, trade_id: str, pos: dict) -> None:
         """Calculate and attach a 3x ATR stop to an unprotected trade.

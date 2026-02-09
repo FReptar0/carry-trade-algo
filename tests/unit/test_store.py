@@ -403,3 +403,134 @@ class TestFinancingMigration:
         """get_total_financing should return 0 with no closed trades."""
         total = store.get_total_financing()
         assert total == pytest.approx(0.0)
+
+
+class TestPositionStatePersistence:
+    """Tests for save_positions / load_positions / delete_position."""
+
+    def test_save_and_load_positions(self, store):
+        """Round-trip: save two positions, load them back, verify all fields."""
+        positions = {
+            "USD/JPY": {
+                "entry_price": 155.0,
+                "units": 10000,
+                "high_water_mark": 156.5,
+                "low_water_mark": 154.0,
+                "entry_atr": 0.65,
+                "original_units": 10000,
+                "tranche_count": 2,
+                "levels_taken": 1,
+                "financing": 5.50,
+                "last_vol_trim_time": None,
+            },
+            "AUD/JPY": {
+                "entry_price": 98.0,
+                "units": 5000,
+                "high_water_mark": 99.0,
+                "low_water_mark": 97.5,
+                "entry_atr": 0.40,
+                "original_units": 8000,
+                "tranche_count": 1,
+                "levels_taken": 0,
+                "financing": 3.25,
+                "last_vol_trim_time": None,
+            },
+        }
+        store.save_positions(positions)
+        loaded = store.load_positions()
+
+        assert set(loaded.keys()) == {"USD/JPY", "AUD/JPY"}
+        assert loaded["USD/JPY"]["high_water_mark"] == 156.5
+        assert loaded["USD/JPY"]["original_units"] == 10000
+        assert loaded["USD/JPY"]["tranche_count"] == 2
+        assert loaded["AUD/JPY"]["entry_atr"] == pytest.approx(0.40)
+        assert loaded["AUD/JPY"]["financing"] == pytest.approx(3.25)
+
+    def test_load_positions_empty(self, store):
+        """load_positions returns empty dict when no data."""
+        loaded = store.load_positions()
+        assert loaded == {}
+
+    def test_delete_position(self, store):
+        """delete_position removes a specific pair."""
+        positions = {
+            "USD/JPY": {"entry_price": 155.0, "units": 10000},
+            "AUD/JPY": {"entry_price": 98.0, "units": 5000},
+        }
+        store.save_positions(positions)
+        store.delete_position("USD/JPY")
+
+        loaded = store.load_positions()
+        assert "USD/JPY" not in loaded
+        assert "AUD/JPY" in loaded
+
+    def test_save_positions_handles_datetime_serialization(self, store):
+        """Datetimes survive round-trip through JSON serialization."""
+        entry_time = datetime(2026, 2, 3, 4, 14, 56, 582484)
+        trim_time = datetime(2026, 2, 7, 10, 30, 0)
+
+        positions = {
+            "USD/JPY": {
+                "entry_price": 155.0,
+                "units": 10000,
+                "entry_time": entry_time,
+                "last_vol_trim_time": trim_time,
+            },
+        }
+        store.save_positions(positions)
+        loaded = store.load_positions()
+
+        assert loaded["USD/JPY"]["entry_time"] == entry_time
+        assert loaded["USD/JPY"]["last_vol_trim_time"] == trim_time
+
+    def test_save_positions_cleans_stale_pairs(self, store):
+        """Pairs removed from the dict are deleted from the DB."""
+        # Save two pairs
+        store.save_positions(
+            {
+                "USD/JPY": {"entry_price": 155.0, "units": 10000},
+                "AUD/JPY": {"entry_price": 98.0, "units": 5000},
+            }
+        )
+
+        # Save only one pair — AUD/JPY should be deleted
+        store.save_positions(
+            {
+                "USD/JPY": {"entry_price": 155.5, "units": 10000},
+            }
+        )
+
+        loaded = store.load_positions()
+        assert "USD/JPY" in loaded
+        assert "AUD/JPY" not in loaded
+
+    def test_save_positions_empty_clears_all(self, store):
+        """Saving an empty dict clears all rows."""
+        store.save_positions({"USD/JPY": {"entry_price": 155.0, "units": 10000}})
+        store.save_positions({})
+        loaded = store.load_positions()
+        assert loaded == {}
+
+    def test_save_positions_upsert_updates_existing(self, store):
+        """Saving the same pair twice updates (not duplicates) the row."""
+        store.save_positions({"USD/JPY": {"high_water_mark": 155.0}})
+        store.save_positions({"USD/JPY": {"high_water_mark": 157.0}})
+        loaded = store.load_positions()
+        assert loaded["USD/JPY"]["high_water_mark"] == 157.0
+
+    def test_delete_position_nonexistent_pair(self, store):
+        """Deleting a pair that doesn't exist should not raise."""
+        store.delete_position("NZD/JPY")  # Should be a no-op
+
+    def test_datetime_none_survives_roundtrip(self, store):
+        """last_vol_trim_time=None should not become a string."""
+        positions = {
+            "USD/JPY": {
+                "entry_price": 155.0,
+                "last_vol_trim_time": None,
+                "entry_time": datetime(2026, 2, 1, 10, 0, 0),
+            },
+        }
+        store.save_positions(positions)
+        loaded = store.load_positions()
+        assert loaded["USD/JPY"]["last_vol_trim_time"] is None

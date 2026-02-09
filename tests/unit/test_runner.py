@@ -1937,3 +1937,249 @@ class TestSyncEntryTime:
         assert pos_aud is not None
         assert pos_usd["entry_time"] == usdjpy_time
         assert pos_aud["entry_time"] == audjpy_time
+
+
+class TestPositionStatePersistence:
+    """Tests for SQLite position state persistence in the runner."""
+
+    def test_sync_restores_persisted_hwm(self, runner):
+        """HWM from SQLite should overwrite OANDA default (entry price)."""
+        # Persist a high_water_mark that's above entry
+        runner.store.save_positions(
+            {
+                "USD/JPY": {
+                    "high_water_mark": 158.0,
+                    "entry_atr": 0.65,
+                    "original_units": 10000,
+                    "tranche_count": 2,
+                    "levels_taken": 1,
+                    "low_water_mark": 153.5,
+                    "last_vol_trim_time": None,
+                    "financing": 5.50,
+                },
+            }
+        )
+
+        # OANDA returns a position at 155.0 — default HWM would be 155.0
+        runner.broker.get_all_positions.return_value = [
+            {
+                "pair": "USD/JPY",
+                "units": 10000,
+                "avg_price": 155.0,
+                "unrealized_pnl": 50.0,
+            }
+        ]
+        runner.broker.get_open_trades.return_value = [
+            {
+                "trade_id": "T100",
+                "pair": "USD/JPY",
+                "units": 10000,
+                "price": 155.0,
+                "financing": 0.0,
+                "stop_loss_price": 153.0,
+                "unrealized_pnl": 50.0,
+                "open_time": datetime(2026, 2, 1, 10, 0, tzinfo=UTC),
+            }
+        ]
+
+        df = _make_candle_df(50, 155.0)
+        runner._candle_cache["USD/JPY"] = df
+
+        runner._sync_positions()
+
+        pos = runner._strategy_positions["USD/JPY"]
+        # Persisted HWM (158.0) > OANDA default (155.0), so it should win
+        assert pos["high_water_mark"] == 158.0
+
+    def test_sync_restores_persisted_original_units(self, runner):
+        """original_units from SQLite should survive restart."""
+        runner.store.save_positions(
+            {
+                "USD/JPY": {
+                    "high_water_mark": 155.0,
+                    "entry_atr": 0.65,
+                    "original_units": 15000,
+                    "tranche_count": 3,
+                    "levels_taken": 2,
+                    "low_water_mark": 153.0,
+                    "last_vol_trim_time": None,
+                    "financing": 0.0,
+                },
+            }
+        )
+
+        runner.broker.get_all_positions.return_value = [
+            {
+                "pair": "USD/JPY",
+                "units": 8000,  # Trimmed by vol scaling
+                "avg_price": 155.0,
+                "unrealized_pnl": 0.0,
+            }
+        ]
+        runner.broker.get_open_trades.return_value = [
+            {
+                "trade_id": "T200",
+                "pair": "USD/JPY",
+                "units": 8000,
+                "price": 155.0,
+                "financing": 0.0,
+                "stop_loss_price": 153.0,
+                "unrealized_pnl": 0.0,
+                "open_time": datetime(2026, 2, 1, 10, 0, tzinfo=UTC),
+            }
+        ]
+
+        df = _make_candle_df(50, 155.0)
+        runner._candle_cache["USD/JPY"] = df
+
+        runner._sync_positions()
+
+        pos = runner._strategy_positions["USD/JPY"]
+        # original_units should be restored from persistence, not current units
+        assert pos["original_units"] == 15000
+        assert pos["tranche_count"] == 3
+        assert pos["levels_taken"] == 2
+
+    def test_sync_ignores_persisted_data_for_unknown_pairs(self, runner):
+        """Pairs in SQLite but not on OANDA should be skipped."""
+        # Persist data for a pair that no longer exists on OANDA
+        runner.store.save_positions(
+            {
+                "GBP/JPY": {
+                    "high_water_mark": 215.0,
+                    "entry_atr": 0.80,
+                    "original_units": 5000,
+                    "tranche_count": 1,
+                    "levels_taken": 0,
+                    "low_water_mark": 212.0,
+                    "last_vol_trim_time": None,
+                    "financing": 1.0,
+                },
+            }
+        )
+
+        # OANDA only has USD/JPY
+        runner.broker.get_all_positions.return_value = [
+            {
+                "pair": "USD/JPY",
+                "units": 10000,
+                "avg_price": 155.0,
+                "unrealized_pnl": 0.0,
+            }
+        ]
+        runner.broker.get_open_trades.return_value = [
+            {
+                "trade_id": "T300",
+                "pair": "USD/JPY",
+                "units": 10000,
+                "price": 155.0,
+                "financing": 0.0,
+                "stop_loss_price": 153.0,
+                "unrealized_pnl": 0.0,
+                "open_time": datetime(2026, 2, 1, 10, 0, tzinfo=UTC),
+            }
+        ]
+
+        df = _make_candle_df(50, 155.0)
+        runner._candle_cache["USD/JPY"] = df
+
+        runner._sync_positions()
+
+        # GBP/JPY should NOT appear in strategy positions
+        assert "GBP/JPY" not in runner._strategy_positions
+        assert "USD/JPY" in runner._strategy_positions
+
+    def test_tick_saves_positions_to_store(self, runner):
+        """save_positions should be called at end of _tick()."""
+        runner.store.save_positions = MagicMock()
+
+        runner._strategy_positions["USD/JPY"] = {
+            "entry_price": 155.0,
+            "entry_time": datetime.now(UTC),
+            "units": 10000,
+            "trade_id": "T100",
+            "stop_price": 153.0,
+            "high_water_mark": 155.5,
+            "low_water_mark": 154.0,
+            "financing": 0.0,
+            "tranche_count": 1,
+            "levels_taken": 0,
+            "entry_atr": 0.65,
+            "original_units": 10000,
+            "last_vol_trim_time": None,
+            "trade_ids": ["T100"],
+        }
+
+        # Minimal broker setup for _tick to run
+        runner.broker.get_account_state.return_value = {
+            "balance": 100000.0,
+            "equity": 100050.0,
+            "unrealized_pnl": 50.0,
+            "margin_used": 1000.0,
+            "margin_available": 99000.0,
+            "open_positions": 1,
+        }
+        runner.broker.get_all_positions.return_value = [
+            {
+                "pair": "USD/JPY",
+                "units": 10000,
+                "avg_price": 155.0,
+                "unrealized_pnl": 50.0,
+                "financing": 0.0,
+            }
+        ]
+        runner.broker.fetch_candles.return_value = _make_candle_df(300, 155.0)
+        runner.broker.get_open_trades.return_value = [
+            {
+                "trade_id": "T100",
+                "pair": "USD/JPY",
+                "units": 10000,
+                "price": 155.0,
+                "financing": 0.0,
+                "stop_loss_price": 153.0,
+            }
+        ]
+        runner.broker.get_pending_orders.return_value = []
+
+        runner._tick()
+
+        runner.store.save_positions.assert_called_once()
+        saved = runner.store.save_positions.call_args[0][0]
+        assert "USD/JPY" in saved
+
+    def test_close_position_deletes_from_store(self, runner):
+        """delete_position should be called when a position is closed."""
+        runner.store.delete_position = MagicMock()
+        runner.store.save_trade = MagicMock()
+
+        runner._strategy_positions["USD/JPY"] = {
+            "entry_price": 155.0,
+            "entry_time": datetime(2026, 2, 1, 10, 0, tzinfo=UTC),
+            "units": 10000,
+            "financing": 2.50,
+        }
+
+        fill = Fill(
+            fill_id="f1",
+            order_id="ORD1",
+            timestamp=datetime.now(),
+            price=156.0,
+            quantity=10000,
+            commission=0,
+            slippage=0,
+        )
+        order = Order(
+            pair="USD/JPY",
+            side=OrderSide.SELL,
+            order_type=MagicMock(),
+            quantity=10000,
+            status=OrderStatus.FILLED,
+            fills=[fill],
+        )
+        runner.broker.close_position.return_value = order
+
+        now = datetime(2026, 2, 1, 14, 0, tzinfo=UTC)
+        runner._close_position("USD/JPY", "Test exit", now)
+
+        runner.store.delete_position.assert_called_once_with("USD/JPY")
+        assert "USD/JPY" not in runner._strategy_positions

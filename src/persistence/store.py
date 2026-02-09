@@ -1,7 +1,8 @@
 """SQLite-based state persistence for the trading system.
 
 Stores protocol state, daily results, equity snapshots, trade logs,
-and checkpoints so the system can resume after container restarts.
+checkpoints, and live position metadata so the system can resume
+after container restarts without losing position state.
 
 Tables:
     protocol_state  - Current protocol status and configuration
@@ -9,13 +10,14 @@ Tables:
     equity_snapshots - Periodic equity/balance snapshots
     trade_log       - Completed trade records
     checkpoints     - Protocol checkpoint results
+    position_states - Live position metadata (survives restarts)
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -122,6 +124,12 @@ class StateStore:
                     total_trades INTEGER NOT NULL,
                     issues TEXT NOT NULL,
                     recommendation TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS position_states (
+                    pair TEXT PRIMARY KEY,
+                    state_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
             """)
             conn.commit()
@@ -480,3 +488,121 @@ class StateStore:
             return float(row["total"]) if row else 0.0
         finally:
             conn.close()
+
+    # ------------------------------------------------------------------
+    # Position state persistence (survives container restarts)
+    # ------------------------------------------------------------------
+
+    def save_positions(self, positions: dict[str, dict]) -> None:
+        """Persist all open position dicts to SQLite.
+
+        For each pair, serializes the position dict to JSON (converting
+        datetime objects to ISO strings) and upserts into position_states.
+        Rows for pairs no longer in *positions* are deleted (stale cleanup).
+
+        Args:
+            positions: Mapping of pair -> position dict.
+        """
+        conn = self._get_conn()
+        try:
+            now_iso = datetime.now(timezone.utc).isoformat()
+
+            for pair, pos in positions.items():
+                serializable = self._serialize_position(pos)
+                state_json = json.dumps(serializable)
+                conn.execute(
+                    "INSERT INTO position_states (pair, state_json, updated_at) "
+                    "VALUES (?, ?, ?) "
+                    "ON CONFLICT(pair) DO UPDATE SET "
+                    "state_json = excluded.state_json, "
+                    "updated_at = excluded.updated_at",
+                    (pair, state_json, now_iso),
+                )
+
+            # Delete stale rows for pairs no longer held
+            if positions:
+                placeholders = ",".join("?" for _ in positions)
+                conn.execute(
+                    f"DELETE FROM position_states WHERE pair NOT IN ({placeholders})",
+                    list(positions.keys()),
+                )
+            else:
+                conn.execute("DELETE FROM position_states")
+
+            conn.commit()
+        finally:
+            conn.close()
+
+    def load_positions(self) -> dict[str, dict]:
+        """Load all persisted position states from SQLite.
+
+        Deserializes JSON back into dicts, converting ISO datetime
+        strings back to ``datetime`` objects for known datetime fields.
+
+        Returns:
+            Mapping of pair -> position dict. Empty dict if no data.
+        """
+        conn = self._get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT pair, state_json FROM position_states"
+            ).fetchall()
+
+            result: dict[str, dict] = {}
+            for row in rows:
+                pos = json.loads(row["state_json"])
+                self._deserialize_datetimes(pos)
+                result[row["pair"]] = pos
+            return result
+        finally:
+            conn.close()
+
+    def delete_position(self, pair: str) -> None:
+        """Remove a single position from the position_states table.
+
+        Called when a position is closed so stale data is not restored
+        on the next restart.
+
+        Args:
+            pair: Currency pair to remove (e.g. "USD/JPY").
+        """
+        conn = self._get_conn()
+        try:
+            conn.execute("DELETE FROM position_states WHERE pair = ?", (pair,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Internal helpers for position serialization
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _serialize_position(pos: dict) -> dict:
+        """Convert a position dict to a JSON-safe dict.
+
+        Converts ``datetime`` values to ISO 8601 strings.
+        """
+        result = {}
+        for key, value in pos.items():
+            if isinstance(value, datetime):
+                result[key] = value.isoformat()
+            else:
+                result[key] = value
+        return result
+
+    _DATETIME_FIELDS = {"entry_time", "last_vol_trim_time"}
+
+    @classmethod
+    def _deserialize_datetimes(cls, pos: dict) -> None:
+        """Convert known ISO datetime strings back to ``datetime`` objects.
+
+        Modifies *pos* in place.
+        """
+        for field in cls._DATETIME_FIELDS:
+            value = pos.get(field)
+            if isinstance(value, str):
+                try:
+                    pos[field] = datetime.fromisoformat(value)
+                except (ValueError, TypeError):
+                    pass  # Leave as-is if unparseable
