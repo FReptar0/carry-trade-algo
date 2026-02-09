@@ -172,9 +172,12 @@ class TradingProtocol:
             return True, f"Max drawdown exceeded: {drawdown:.1%}"
 
         # 2. Check consecutive losing days
+        # Only count days with actual negative PnL (daily_pnl < 0).
+        # Days with zero PnL (no activity / break-even / swap-only)
+        # are neutral and should not count toward the streak.
         if len(self.days) >= self.abort_criteria.consecutive_losing_days:
             recent = self.days[-self.abort_criteria.consecutive_losing_days :]
-            if all(not d.is_profitable for d in recent):
+            if all(d.daily_pnl < 0 for d in recent):
                 return True, f"{len(recent)} consecutive losing days"
 
         # 3. Check circuit breaker count

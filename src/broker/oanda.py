@@ -322,13 +322,16 @@ class OandaBroker:
         return order
 
     @_retry
-    def close_position(self, pair: str, side: str = "long") -> Optional[Order]:
-        """Close the entire position for a pair.
+    def close_position(
+        self, pair: str, side: str = "long", units: int = 0
+    ) -> Optional[Order]:
+        """Close a position (fully or partially) for a pair.
 
         Args:
             pair: Currency pair (e.g., "USD/JPY").
             side: Which side to close ("long" or "short"). Defaults to "long"
                 since the carry trade strategy only holds longs.
+            units: Number of units to close. 0 means close ALL units.
 
         Returns:
             Order representing the close, or None on failure.
@@ -337,10 +340,11 @@ class OandaBroker:
         # Only close the specified side to avoid rejection when the other
         # side doesn't exist. OANDA rejects the whole request if you try
         # to close a non-existent short alongside an existing long.
+        unit_str = str(units) if units > 0 else "ALL"
         if side == "long":
-            data = {"longUnits": "ALL"}
+            data = {"longUnits": unit_str}
         else:
-            data = {"shortUnits": "ALL"}
+            data = {"shortUnits": unit_str}
 
         endpoint = positions_api.PositionClose(
             accountID=self.account_id,

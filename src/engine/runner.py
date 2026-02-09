@@ -61,7 +61,11 @@ from src.risk.scaling import ScaleManager
 from src.strategy.base import Signal
 from src.strategy.carry_trade_v3 import CarryTradeStrategyV3
 from src.utils.logger import TradingLogger
-from src.validation.protocol import ProtocolDay, TradingProtocol
+from src.validation.protocol import (
+    ProtocolDay,
+    ProtocolStatus,
+    TradingProtocol,
+)
 
 UTC = ZoneInfo("UTC")
 
@@ -273,15 +277,33 @@ class TradingRunner:
             logger.debug("No bandit model loaded: %s", e)
 
     def _restore_or_create_protocol(self) -> TradingProtocol:
-        """Load protocol from database or create a new one."""
+        """Load protocol from database or create a new one.
+
+        If the protocol was previously aborted, reset it to running
+        so the 30-day evaluation can continue. All daily history,
+        start date, and checkpoints are preserved.
+        """
         protocol = self.store.load_protocol_state()
         if protocol is not None:
-            logger.info(
-                "Restored protocol: day %d/%d, status=%s",
-                len(protocol.days),
-                protocol.duration,
-                protocol.status.value,
-            )
+            if protocol.status == ProtocolStatus.ABORTED:
+                logger.warning(
+                    "Protocol was aborted (%s) — resuming as "
+                    "running (day %d/%d, history preserved)",
+                    protocol.abort_reason,
+                    len(protocol.days),
+                    protocol.duration,
+                )
+                protocol.status = ProtocolStatus.RUNNING
+                protocol.abort_reason = None
+                protocol.end_date = None
+                self.store.save_protocol_state(protocol)
+            else:
+                logger.info(
+                    "Restored protocol: day %d/%d, status=%s",
+                    len(protocol.days),
+                    protocol.duration,
+                    protocol.status.value,
+                )
             return protocol
 
         protocol = TradingProtocol(
@@ -458,6 +480,9 @@ class TradingRunner:
                 "Protocol not running (status=%s), skipping",
                 self.protocol.status.value,
             )
+            # Still record heartbeat so the watchdog knows the
+            # system is alive even when not actively trading.
+            self.watchdog.heartbeat()
             return
 
         # 3. Check economic calendar
@@ -809,6 +834,19 @@ class TradingRunner:
 
         if order is None or order.avg_fill_price is None:
             logger.error("Failed to close position for %s", pair)
+            # Defensive cleanup: if the position no longer exists on
+            # the broker (e.g., already closed), remove the ghost
+            # entry from internal tracking to prevent repeated failures.
+            broker_positions = self.broker.get_all_positions()
+            if broker_positions is not None:
+                broker_pairs = {p["pair"] for p in broker_positions}
+                if pair not in broker_pairs:
+                    logger.warning(
+                        "Ghost position detected: %s not on broker, "
+                        "removing from internal tracking",
+                        pair,
+                    )
+                    self._strategy_positions.pop(pair, None)
             return
 
         exit_price = order.avg_fill_price
@@ -976,8 +1014,10 @@ class TradingRunner:
                 position["units"], level_idx
             )
             if reduce_units > 0 and reduce_units < position["units"]:
-                order = self.broker.submit_market_order(
-                    pair=pair, side=OrderSide.SELL, units=reduce_units
+                # Use partial position close (not a SELL order) to
+                # reduce the position through OANDA's position endpoint.
+                order = self.broker.close_position(
+                    pair=pair, units=reduce_units
                 )
                 if order and order.avg_fill_price:
                     position["units"] -= reduce_units
