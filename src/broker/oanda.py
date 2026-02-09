@@ -331,38 +331,6 @@ class OandaBroker:
         )
         return order
 
-        fill_price = float(fill_data["price"])
-        fill_units = abs(int(fill_data["units"]))
-
-        order = Order(
-            pair=pair,
-            side=side,
-            order_type=OrderType.MARKET,
-            quantity=float(units),
-            status=OrderStatus.FILLED,
-            filled_at=datetime.now(),
-            fills=[
-                Fill(
-                    fill_id=fill_data["id"],
-                    order_id=fill_data.get("orderID", ""),
-                    timestamp=datetime.now(),
-                    price=fill_price,
-                    quantity=float(fill_units),
-                    commission=float(fill_data.get("commission", "0")),
-                    slippage=0.0,
-                )
-            ],
-        )
-
-        logger.info(
-            "Order filled: %s %s %d units @ %.5f",
-            side.name,
-            pair,
-            fill_units,
-            fill_price,
-        )
-        return order
-
     @_retry
     def close_position(
         self, pair: str, side: str = "long", units: int = 0
