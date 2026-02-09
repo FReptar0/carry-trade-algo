@@ -59,6 +59,7 @@ from src.monitoring.performance import PerformanceMonitor, TradeRecord
 from src.news.calendar import EconomicCalendar
 from src.ops.alerts import AlertConfig, AlertManager
 from src.ops.reconciler import Reconciler
+from src.ops.telegram_bot import TelegramCommandBot
 from src.ops.watchdog import Watchdog
 from src.persistence.store import StateStore
 from src.risk.circuit_breakers import CircuitBreaker, PortfolioState, RiskLimits
@@ -162,7 +163,9 @@ class TradingRunner:
         )
         self.reconciler = Reconciler(alert_manager=self.alert_manager)
         self._last_market_state: bool = True  # Track market open/close
+        self._last_tick_time: Optional[datetime] = None  # For /health
         self.calendar = self._init_calendar()
+        self.command_bot = self._init_command_bot()
 
         # Phase B: Adaptive parameters (loaded lazily)
         self._param_store = None
@@ -230,6 +233,79 @@ class TradingRunner:
             )
         logger.info("AlertManager disabled (no Telegram credentials)")
         return None
+
+    def _init_command_bot(self) -> Optional[TelegramCommandBot]:
+        """Initialize TelegramCommandBot if Telegram credentials exist."""
+        token = self.config.telegram_bot_token or os.getenv("TELEGRAM_BOT_TOKEN", "")
+        chat_id = self.config.telegram_chat_id or os.getenv("TELEGRAM_CHAT_ID", "")
+        if token and chat_id:
+            return TelegramCommandBot(
+                bot_token=token,
+                chat_id=chat_id,
+                state_provider=self.get_system_state,
+            )
+        logger.info("CommandBot disabled (no Telegram credentials)")
+        return None
+
+    def get_system_state(self) -> dict:
+        """Collect current system state for Telegram command responses.
+
+        Thread-safe: reads internal state without mutating it.
+        Called from the TelegramCommandBot polling thread.
+
+        Returns:
+            Dict with account, protocol, positions, performance info.
+        """
+        # Account state (cached to avoid hammering OANDA from the bot thread)
+        acct = self.broker.get_account_state() or {}
+
+        # Protocol info
+        progress = self.protocol.get_progress()
+        snapshot = self.monitor.get_snapshot()
+        protocol_info = {
+            "day": progress.get("days_completed", 0),
+            "duration": self.protocol.duration,
+            "status": progress.get("status", "unknown"),
+            "drawdown": snapshot.drawdown,
+            "degraded_reason": getattr(self.protocol, "degraded_reason", None),
+        }
+
+        # Positions with current prices from broker
+        broker_positions = self.broker.get_all_positions() or []
+        positions = []
+        for bp in broker_positions:
+            pair = bp.get("pair", "")
+            internal = self._strategy_positions.get(pair, {})
+            positions.append(
+                {
+                    "pair": pair,
+                    "units": bp.get("units", 0),
+                    "entry_price": internal.get("entry_price", bp.get("avg_price", 0)),
+                    "current_price": bp.get("avg_price", 0)
+                    + (bp.get("unrealized_pnl", 0) / max(bp.get("units", 1), 1)),
+                    "unrealized_pnl": bp.get("unrealized_pnl", 0),
+                    "stop_price": internal.get("stop_price"),
+                    "high_water_mark": internal.get("high_water_mark", 0),
+                    "entry_time": internal.get("entry_time"),
+                    "tranche_count": internal.get("tranche_count", 1),
+                }
+            )
+
+        # Performance
+        daily_pnl = acct.get("equity", 0) - self._day_start_equity
+        perf = {
+            "daily_pnl": daily_pnl,
+            "high_water_mark": snapshot.high_water_mark,
+        }
+
+        return {
+            "account": acct,
+            "protocol": protocol_info,
+            "positions": positions,
+            "performance": perf,
+            "last_tick": self._last_tick_time,
+            "market_open": ForexMarketHours.is_market_open(datetime.now(UTC)),
+        }
 
     def _init_calendar(self) -> EconomicCalendar:
         """Initialize calendar, preferring live feed over static."""
@@ -428,6 +504,10 @@ class TradingRunner:
         # Run initial tick
         self._tick()
 
+        # Start Telegram command bot (after initial tick so state is populated)
+        if self.command_bot:
+            self.command_bot.start()
+
         try:
             self.scheduler.start()
         except (KeyboardInterrupt, SystemExit):
@@ -441,6 +521,10 @@ class TradingRunner:
         """
         logger.info("Stopping runner: %s", reason)
         self.running = False
+
+        # Stop command bot
+        if self.command_bot:
+            self.command_bot.stop()
 
         # Save final state
         self._record_day_result()
@@ -651,6 +735,9 @@ class TradingRunner:
             daily_pnl,
             pos_count,
         )
+
+        # Track last tick time for /health command
+        self._last_tick_time = now
 
     def _process_pair(
         self,
