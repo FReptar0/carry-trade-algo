@@ -125,6 +125,9 @@ class AlertManager:
             f"Drawdown: {snapshot.get('drawdown', 0):.2%}",
             f"Positions: {snapshot.get('positions_count', 0)}",
         ]
+        financing = snapshot.get("financing", 0)
+        if financing != 0:
+            lines.append(f"Carry Income: {financing:+,.2f}")
         text = "\n".join(lines)
         return self._send_telegram(text)
 

@@ -66,9 +66,7 @@ class TestStateStoreInit:
 
     def test_tables_created(self, store):
         conn = sqlite3.connect(store.db_path)
-        cursor = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        )
+        cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
         tables = {row[0] for row in cursor.fetchall()}
         conn.close()
         assert "protocol_state" in tables
@@ -172,9 +170,7 @@ class TestDailyResults:
         store.save_daily_result(updated)
 
         conn = sqlite3.connect(store.db_path)
-        count = conn.execute(
-            "SELECT COUNT(*) FROM daily_results"
-        ).fetchone()[0]
+        count = conn.execute("SELECT COUNT(*) FROM daily_results").fetchone()[0]
         conn.close()
         assert count == 1
 
@@ -277,10 +273,133 @@ class TestCheckpoints:
         )
         conn = sqlite3.connect(store.db_path)
         conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT * FROM checkpoints WHERE day = 7"
-        ).fetchone()
+        row = conn.execute("SELECT * FROM checkpoints WHERE day = 7").fetchone()
         conn.close()
         assert row is not None
         assert row["recommendation"] == "continue"
         assert row["cumulative_return"] == 0.02
+
+
+class TestFinancingMigration:
+    """Tests for financing/swap column migrations."""
+
+    def test_equity_snapshots_has_financing_column(self, store):
+        """Migration should add financing column to equity_snapshots."""
+        conn = sqlite3.connect(store.db_path)
+        cols = [
+            row[1]
+            for row in conn.execute("PRAGMA table_info(equity_snapshots)").fetchall()
+        ]
+        conn.close()
+        assert "financing" in cols
+
+    def test_daily_results_has_financing_column(self, store):
+        """Migration should add financing column to daily_results."""
+        conn = sqlite3.connect(store.db_path)
+        cols = [
+            row[1]
+            for row in conn.execute("PRAGMA table_info(daily_results)").fetchall()
+        ]
+        conn.close()
+        assert "financing" in cols
+
+    def test_save_equity_snapshot_with_financing(self, store):
+        """Equity snapshot should persist the financing value."""
+        now = datetime(2026, 2, 8, 12, 0)
+        store.save_equity_snapshot(
+            timestamp=now,
+            equity=100500,
+            balance=100200,
+            unrealized_pnl=300,
+            positions_count=3,
+            drawdown=0.005,
+            financing=12.45,
+        )
+        conn = sqlite3.connect(store.db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM equity_snapshots ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row["financing"] == pytest.approx(12.45)
+
+    def test_save_equity_snapshot_defaults_financing_zero(self, store):
+        """Financing should default to 0 if not provided."""
+        now = datetime(2026, 2, 8, 13, 0)
+        store.save_equity_snapshot(
+            timestamp=now,
+            equity=100500,
+            balance=100200,
+            unrealized_pnl=300,
+            positions_count=3,
+            drawdown=0.005,
+        )
+        conn = sqlite3.connect(store.db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM equity_snapshots ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        assert row["financing"] == pytest.approx(0.0)
+
+    def test_save_daily_result_with_financing(self, store):
+        """Daily result should persist financing via getattr fallback."""
+        day = ProtocolDay(
+            date=date(2026, 2, 8),
+            starting_equity=100000,
+            ending_equity=100500,
+            daily_pnl=500,
+            daily_return=0.005,
+            trades_opened=1,
+            trades_closed=0,
+            max_drawdown_today=0.01,
+            regime="LIVE",
+            circuit_breaker_triggered=False,
+        )
+        # ProtocolDay doesn't have financing attr, so getattr defaults to 0
+        store.save_daily_result(day)
+        conn = sqlite3.connect(store.db_path)
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM daily_results WHERE date = '2026-02-08'"
+        ).fetchone()
+        conn.close()
+        assert row is not None
+        assert row["financing"] == pytest.approx(0.0)
+
+    def test_get_total_financing(self, store):
+        """get_total_financing should sum swap_earned from closed trades."""
+        for i, swap in enumerate([5.50, 3.25, -1.00]):
+            store.save_trade(
+                {
+                    "timestamp": f"2026-02-0{i + 1}T12:00:00",
+                    "pair": "USD/JPY",
+                    "side": "SELL",
+                    "entry_price": 155.0,
+                    "exit_price": 156.0,
+                    "quantity": 10000,
+                    "pnl": 100.0,
+                    "swap_earned": swap,
+                    "status": "closed",
+                }
+            )
+        # Also add an open trade (should be excluded)
+        store.save_trade(
+            {
+                "timestamp": "2026-02-04T12:00:00",
+                "pair": "AUD/JPY",
+                "side": "BUY",
+                "entry_price": 98.0,
+                "quantity": 10000,
+                "swap_earned": 99.99,
+                "status": "open",
+            }
+        )
+        total = store.get_total_financing()
+        assert total == pytest.approx(7.75)
+
+    def test_get_total_financing_empty(self, store):
+        """get_total_financing should return 0 with no closed trades."""
+        total = store.get_total_financing()
+        assert total == pytest.approx(0.0)

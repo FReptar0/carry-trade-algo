@@ -561,6 +561,7 @@ class OandaBroker:
                     "units": int(t["currentUnits"]),
                     "price": float(t["price"]),
                     "unrealized_pnl": float(t.get("unrealizedPL", "0")),
+                    "financing": float(t.get("financing", "0")),
                     "stop_loss_price": sl_price,
                 }
             )

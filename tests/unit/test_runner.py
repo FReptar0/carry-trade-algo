@@ -286,6 +286,7 @@ class TestProtocolRestore:
                 regime="LIVE",
                 circuit_breaker_triggered=False,
                 notes="",
+                financing=0.0,
             )
         )
 
@@ -722,3 +723,198 @@ class TestSafeAbort:
 
         # Should have attempted both
         assert call_count[0] == 2
+
+
+class TestFinancingTracking:
+    """Tests for swap/financing PnL tracking in the runner."""
+
+    def test_tick_syncs_financing_from_broker(self, runner):
+        """After reconciliation, financing should be synced from broker data."""
+        # Set up a position without financing
+        runner._strategy_positions["USD/JPY"] = {
+            "entry_price": 155.0,
+            "entry_time": datetime.now(UTC),
+            "units": 10000,
+            "trade_id": "T100",
+            "stop_price": 152.0,
+            "high_water_mark": 155.5,
+            "low_water_mark": 154.0,
+            "financing": 0.0,
+        }
+
+        # Broker returns financing data
+        runner.broker.get_all_positions.return_value = [
+            {
+                "pair": "USD/JPY",
+                "units": 10000,
+                "avg_price": 155.0,
+                "unrealized_pnl": 50.0,
+                "financing": 12.45,
+            }
+        ]
+
+        # Simulate the sync step from _tick (step 5b)
+        broker_positions = runner.broker.get_all_positions()
+        bp_by_pair = {bp["pair"]: bp for bp in broker_positions}
+        for pair, pos in runner._strategy_positions.items():
+            bp = bp_by_pair.get(pair)
+            if bp is not None:
+                pos["financing"] = bp.get("financing", 0.0)
+
+        assert runner._strategy_positions["USD/JPY"]["financing"] == 12.45
+
+    def test_close_position_records_financing(self, runner):
+        """_close_position should pass financing to TradeRecord and store."""
+        runner._strategy_positions["USD/JPY"] = {
+            "entry_price": 155.500,
+            "entry_time": datetime(2026, 2, 1, 10, 0, tzinfo=UTC),
+            "units": 10000,
+            "financing": 8.73,
+        }
+
+        fill = Fill(
+            fill_id="789",
+            order_id="012",
+            timestamp=datetime.now(),
+            price=156.000,
+            quantity=10000,
+            commission=0,
+            slippage=0,
+        )
+        order = Order(
+            pair="USD/JPY",
+            side=OrderSide.SELL,
+            order_type=MagicMock(),
+            quantity=10000,
+            status=OrderStatus.FILLED,
+            fills=[fill],
+        )
+        runner.broker.close_position.return_value = order
+
+        # Mock store.save_trade so we can inspect call args
+        runner.store.save_trade = MagicMock()
+
+        now = datetime(2026, 2, 1, 14, 0, tzinfo=UTC)
+        runner._close_position("USD/JPY", "Test exit", now)
+
+        # Verify store.save_trade was called with swap_earned
+        assert runner.store.save_trade.called
+        trade_data = runner.store.save_trade.call_args[0][0]
+        assert trade_data["swap_earned"] == 8.73
+
+    def test_close_position_financing_defaults_zero(self, runner):
+        """Positions without financing field should default to 0."""
+        runner._strategy_positions["USD/JPY"] = {
+            "entry_price": 155.500,
+            "entry_time": datetime(2026, 2, 1, 10, 0, tzinfo=UTC),
+            "units": 10000,
+            # No "financing" key
+        }
+
+        fill = Fill(
+            fill_id="789",
+            order_id="012",
+            timestamp=datetime.now(),
+            price=156.000,
+            quantity=10000,
+            commission=0,
+            slippage=0,
+        )
+        order = Order(
+            pair="USD/JPY",
+            side=OrderSide.SELL,
+            order_type=MagicMock(),
+            quantity=10000,
+            status=OrderStatus.FILLED,
+            fills=[fill],
+        )
+        runner.broker.close_position.return_value = order
+
+        # Mock store.save_trade so we can inspect call args
+        runner.store.save_trade = MagicMock()
+
+        now = datetime(2026, 2, 1, 14, 0, tzinfo=UTC)
+        runner._close_position("USD/JPY", "Test exit", now)
+
+        trade_data = runner.store.save_trade.call_args[0][0]
+        assert trade_data["swap_earned"] == 0.0
+
+    def test_get_system_state_includes_financing(self, runner):
+        """get_system_state should include financing in positions and total."""
+        runner._strategy_positions = {
+            "USD/JPY": {
+                "entry_price": 155.0,
+                "entry_time": datetime.now(UTC),
+                "units": 5000,
+                "stop_price": 152.0,
+                "high_water_mark": 155.5,
+                "tranche_count": 1,
+                "financing": 5.50,
+            },
+            "AUD/JPY": {
+                "entry_price": 98.0,
+                "entry_time": datetime.now(UTC),
+                "units": 10000,
+                "stop_price": 95.0,
+                "high_water_mark": 98.5,
+                "tranche_count": 2,
+                "financing": 7.25,
+            },
+        }
+
+        runner.broker.get_all_positions.return_value = [
+            {
+                "pair": "USD/JPY",
+                "units": 5000,
+                "avg_price": 155.0,
+                "unrealized_pnl": 200.0,
+                "financing": 5.50,
+            },
+            {
+                "pair": "AUD/JPY",
+                "units": 10000,
+                "avg_price": 98.0,
+                "unrealized_pnl": 100.0,
+                "financing": 7.25,
+            },
+        ]
+
+        state = runner.get_system_state()
+
+        # Check per-position financing
+        pos_by_pair = {p["pair"]: p for p in state["positions"]}
+        assert pos_by_pair["USD/JPY"]["financing"] == 5.50
+        assert pos_by_pair["AUD/JPY"]["financing"] == 7.25
+
+        # Check total_financing in performance
+        assert state["performance"]["total_financing"] == pytest.approx(12.75)
+
+    def test_get_system_state_zero_financing(self, runner):
+        """get_system_state should handle zero financing gracefully."""
+        runner._strategy_positions = {
+            "USD/JPY": {
+                "entry_price": 155.0,
+                "entry_time": datetime.now(UTC),
+                "units": 5000,
+                "stop_price": 152.0,
+                "high_water_mark": 155.5,
+                "tranche_count": 1,
+                "financing": 0.0,
+            },
+        }
+
+        runner.broker.get_all_positions.return_value = [
+            {
+                "pair": "USD/JPY",
+                "units": 5000,
+                "avg_price": 155.0,
+                "unrealized_pnl": 200.0,
+                "financing": 0.0,
+            },
+        ]
+
+        state = runner.get_system_state()
+
+        pos = state["positions"][0]
+        assert pos["financing"] == 0.0
+        assert state["performance"]["total_financing"] == 0.0

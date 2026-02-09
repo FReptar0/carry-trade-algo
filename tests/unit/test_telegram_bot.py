@@ -374,3 +374,54 @@ class TestBotAPIInteraction:
             failing_bot._process_update(update)
             mock_send.assert_called_once()
             assert "Error" in mock_send.call_args[0][0]
+
+
+class TestFinancingDisplay:
+    """Tests for financing/carry income display in bot commands."""
+
+    def test_status_shows_carry_income(self, bot):
+        """Status should show carry income when positions have financing."""
+        state = _sample_state()
+        state["positions"][0]["financing"] = 5.50
+        state["positions"][1]["financing"] = 7.25
+        state["performance"]["total_financing"] = 12.75
+        result = bot._handle_status(state)
+        assert "Carry income" in result
+        assert "12.75" in result
+        assert "Total Carry" in result
+
+    def test_status_hides_carry_when_zero(self, bot):
+        """Status should not show carry income lines when financing is 0."""
+        state = _sample_state()
+        state["positions"][0]["financing"] = 0
+        state["positions"][1]["financing"] = 0
+        state["performance"]["total_financing"] = 0
+        result = bot._handle_status(state)
+        assert "Carry income" not in result
+        assert "Total Carry" not in result
+
+    def test_positions_decomposes_pnl(self, bot):
+        """Positions command should decompose PnL into price and carry."""
+        state = _sample_state()
+        state["positions"][0]["financing"] = 12.45
+        result = bot._handle_positions(state)
+        assert "price:" in result
+        assert "carry:" in result
+        assert "12.45" in result
+
+    def test_positions_shows_total_carry(self, bot):
+        """Positions command should show total carry at bottom."""
+        state = _sample_state()
+        state["positions"][0]["financing"] = 5.00
+        state["positions"][1]["financing"] = 3.00
+        result = bot._handle_positions(state)
+        assert "Total Carry" in result
+        assert "8.00" in result
+
+    def test_positions_hides_carry_when_zero(self, bot):
+        """Positions command should not show Total Carry when all zero."""
+        state = _sample_state()
+        state["positions"][0]["financing"] = 0
+        state["positions"][1]["financing"] = 0
+        result = bot._handle_positions(state)
+        assert "Total Carry" not in result

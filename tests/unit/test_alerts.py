@@ -80,3 +80,52 @@ class TestAlertManager:
         mgr = AlertManager(config)
         with patch.object(mgr, "_send_telegram", return_value=True):
             assert mgr.send("INFO", "Test", "Info msg") is True
+
+
+class TestDailySummaryFinancing:
+    """Tests for financing/carry income in daily summary."""
+
+    def test_daily_summary_includes_financing(self, manager):
+        """Daily summary should include carry income when financing > 0."""
+        snapshot = {
+            "equity": 100500.0,
+            "daily_pnl": 500.0,
+            "drawdown": 0.02,
+            "positions_count": 2,
+            "financing": 15.73,
+        }
+        with patch.object(manager, "_send_telegram", return_value=True) as mock:
+            result = manager.send_daily_summary(snapshot)
+            assert result is True
+            call_text = mock.call_args[0][0]
+            assert "Carry Income" in call_text
+            assert "15.73" in call_text
+
+    def test_daily_summary_omits_financing_when_zero(self, manager):
+        """Daily summary should not show carry income line when financing is 0."""
+        snapshot = {
+            "equity": 100500.0,
+            "daily_pnl": 500.0,
+            "drawdown": 0.02,
+            "positions_count": 2,
+            "financing": 0,
+        }
+        with patch.object(manager, "_send_telegram", return_value=True) as mock:
+            result = manager.send_daily_summary(snapshot)
+            assert result is True
+            call_text = mock.call_args[0][0]
+            assert "Carry Income" not in call_text
+
+    def test_daily_summary_omits_financing_when_missing(self, manager):
+        """Daily summary should handle missing financing key gracefully."""
+        snapshot = {
+            "equity": 100500.0,
+            "daily_pnl": 500.0,
+            "drawdown": 0.02,
+            "positions_count": 2,
+        }
+        with patch.object(manager, "_send_telegram", return_value=True) as mock:
+            result = manager.send_daily_summary(snapshot)
+            assert result is True
+            call_text = mock.call_args[0][0]
+            assert "Carry Income" not in call_text

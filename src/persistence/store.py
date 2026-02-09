@@ -133,15 +133,37 @@ class StateStore:
         conn = self._get_conn()
         try:
             # Add degraded_reason column if missing (Phase 2 hardening)
-            cols = [
+            proto_cols = [
                 row[1]
                 for row in conn.execute("PRAGMA table_info(protocol_state)").fetchall()
             ]
-            if "degraded_reason" not in cols:
+            if "degraded_reason" not in proto_cols:
                 conn.execute(
                     "ALTER TABLE protocol_state ADD COLUMN degraded_reason TEXT"
                 )
-                conn.commit()
+
+            # Add financing columns (swap PnL tracking)
+            equity_cols = [
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(equity_snapshots)"
+                ).fetchall()
+            ]
+            if "financing" not in equity_cols:
+                conn.execute(
+                    "ALTER TABLE equity_snapshots ADD COLUMN financing REAL DEFAULT 0"
+                )
+
+            daily_cols = [
+                row[1]
+                for row in conn.execute("PRAGMA table_info(daily_results)").fetchall()
+            ]
+            if "financing" not in daily_cols:
+                conn.execute(
+                    "ALTER TABLE daily_results ADD COLUMN financing REAL DEFAULT 0"
+                )
+
+            conn.commit()
         finally:
             conn.close()
 
@@ -242,13 +264,15 @@ class StateStore:
         """
         conn = self._get_conn()
         try:
+            financing = getattr(day, "financing", 0.0)
             conn.execute(
                 """
                 INSERT OR REPLACE INTO daily_results
                 (date, starting_equity, ending_equity, daily_pnl,
                  daily_return, trades_opened, trades_closed,
-                 max_drawdown_today, regime, circuit_breaker_triggered, notes)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 max_drawdown_today, regime, circuit_breaker_triggered,
+                 notes, financing)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     day.date.isoformat(),
@@ -262,6 +286,7 @@ class StateStore:
                     day.regime,
                     int(day.circuit_breaker_triggered),
                     day.notes,
+                    financing,
                 ),
             )
             conn.commit()
@@ -276,6 +301,7 @@ class StateStore:
         unrealized_pnl: float,
         positions_count: int,
         drawdown: float,
+        financing: float = 0.0,
     ) -> None:
         """Save a periodic equity snapshot.
 
@@ -286,6 +312,7 @@ class StateStore:
             unrealized_pnl: Unrealized P&L.
             positions_count: Number of open positions.
             drawdown: Current drawdown percentage.
+            financing: Cumulative financing/swap across all positions.
         """
         conn = self._get_conn()
         try:
@@ -293,8 +320,8 @@ class StateStore:
                 """
                 INSERT INTO equity_snapshots
                 (timestamp, equity, balance, unrealized_pnl,
-                 positions_count, drawdown)
-                VALUES (?, ?, ?, ?, ?, ?)
+                 positions_count, drawdown, financing)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     timestamp.isoformat(),
@@ -303,6 +330,7 @@ class StateStore:
                     unrealized_pnl,
                     positions_count,
                     drawdown,
+                    financing,
                 ),
             )
             conn.commit()
@@ -434,5 +462,21 @@ class StateStore:
                     "SELECT * FROM trade_log ORDER BY timestamp"
                 ).fetchall()
             return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def get_total_financing(self) -> float:
+        """Get total financing/swap earned from all closed trades.
+
+        Returns:
+            Sum of swap_earned from all closed trades.
+        """
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(swap_earned), 0) as total "
+                "FROM trade_log WHERE status = 'closed'"
+            ).fetchone()
+            return float(row["total"]) if row else 0.0
         finally:
             conn.close()

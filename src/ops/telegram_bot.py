@@ -223,7 +223,10 @@ class TelegramCommandBot:
         # Positions summary
         positions = state.get("positions", [])
         total_pnl = sum(p.get("unrealized_pnl", 0) for p in positions)
+        total_fin = sum(p.get("financing", 0) for p in positions)
         lines.append(f"*Positions ({len(positions)})*  PnL: ${total_pnl:+,.2f}")
+        if total_fin != 0:
+            lines.append(f"  Carry income: ${total_fin:+,.2f}")
         for pos in positions:
             pair = pos.get("pair", "???")
             units = pos.get("units", 0)
@@ -248,9 +251,12 @@ class TelegramCommandBot:
         perf = state.get("performance", {})
         daily_pnl = perf.get("daily_pnl", 0)
         hwm = perf.get("high_water_mark", 0)
+        total_financing = perf.get("total_financing", 0)
         lines.append("*Performance*")
         lines.append(f"  Daily PnL: ${daily_pnl:+,.2f}")
         lines.append(f"  High Water: ${hwm:,.2f}")
+        if total_financing != 0:
+            lines.append(f"  Total Carry: ${total_financing:+,.2f}")
 
         uptime = datetime.now(UTC) - self._start_time
         hours = int(uptime.total_seconds() // 3600)
@@ -325,10 +331,14 @@ class TelegramCommandBot:
             hwm = pos.get("high_water_mark", 0)
             entry_time = pos.get("entry_time")
             tranche_count = pos.get("tranche_count", 1)
+            financing = pos.get("financing", 0)
 
             profit_pct = (
                 ((current - entry) / entry * 100) if entry > 0 and current > 0 else 0
             )
+
+            # Decompose PnL: price movement vs carry income
+            price_pnl = pnl - financing
 
             # Hold duration
             if entry_time:
@@ -347,7 +357,9 @@ class TelegramCommandBot:
             lines.append(f"  Units: {units:,} (tranches: {tranche_count})")
             lines.append(f"  Entry: {entry:.5f}")
             lines.append(f"  Current: {current:.5f} ({profit_pct:+.2f}%)")
-            lines.append(f"  PnL: ${pnl:+,.2f}")
+            lines.append(
+                f"  PnL: ${pnl:+,.2f}  (price: ${price_pnl:+,.2f}, carry: ${financing:+,.2f})"
+            )
             if stop:
                 lines.append(f"  Stop: {stop:.3f} (risk: {risk_pct:.2f}%)")
             else:
@@ -357,7 +369,10 @@ class TelegramCommandBot:
             lines.append("")
 
         total_pnl = sum(p.get("unrealized_pnl", 0) for p in positions)
+        total_fin = sum(p.get("financing", 0) for p in positions)
         lines.append(f"*Total PnL: ${total_pnl:+,.2f}*")
+        if total_fin != 0:
+            lines.append(f"*Total Carry: ${total_fin:+,.2f}*")
 
         return _escape_markdown("\n".join(lines))
 

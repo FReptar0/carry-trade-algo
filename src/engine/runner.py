@@ -273,9 +273,12 @@ class TradingRunner:
         # Positions with current prices from broker
         broker_positions = self.broker.get_all_positions() or []
         positions = []
+        total_financing = 0.0
         for bp in broker_positions:
             pair = bp.get("pair", "")
             internal = self._strategy_positions.get(pair, {})
+            pos_financing = internal.get("financing", bp.get("financing", 0.0))
+            total_financing += pos_financing
             positions.append(
                 {
                     "pair": pair,
@@ -288,6 +291,7 @@ class TradingRunner:
                     "high_water_mark": internal.get("high_water_mark", 0),
                     "entry_time": internal.get("entry_time"),
                     "tranche_count": internal.get("tranche_count", 1),
+                    "financing": pos_financing,
                 }
             )
 
@@ -296,6 +300,7 @@ class TradingRunner:
         perf = {
             "daily_pnl": daily_pnl,
             "high_water_mark": snapshot.high_water_mark,
+            "total_financing": total_financing,
         }
 
         return {
@@ -607,6 +612,15 @@ class TradingRunner:
                     broker_positions,
                 )
 
+            # 5b. Sync financing from broker into internal position state.
+            # get_all_positions() returns cumulative financing per pair —
+            # merge it so we always have the latest OANDA-reported value.
+            bp_by_pair = {bp["pair"]: bp for bp in broker_positions}
+            for pair, pos in self._strategy_positions.items():
+                bp = bp_by_pair.get(pair)
+                if bp is not None:
+                    pos["financing"] = bp.get("financing", 0.0)
+
         # 6. Process each pair
         for pair in self.config.pairs:
             try:
@@ -710,6 +724,9 @@ class TradingRunner:
             logger.error("Stop-loss update sweep failed: %s", e)
 
         # 12. Save equity snapshot
+        total_financing = sum(
+            pos.get("financing", 0.0) for pos in self._strategy_positions.values()
+        )
         self.store.save_equity_snapshot(
             timestamp=now,
             equity=equity,
@@ -717,6 +734,7 @@ class TradingRunner:
             unrealized_pnl=unrealized,
             positions_count=pos_count,
             drawdown=snapshot.drawdown,
+            financing=total_financing,
         )
 
         # 13. Watchdog heartbeat
@@ -942,6 +960,7 @@ class TradingRunner:
             "stop_price": stop_loss_price,
             "high_water_mark": order.avg_fill_price,
             "low_water_mark": order.avg_fill_price,
+            "financing": 0.0,
         }
         self._trades_opened_today += 1
 
@@ -1020,12 +1039,14 @@ class TradingRunner:
         exit_price = order.avg_fill_price
         pnl = 0.0
         duration = timedelta(0)
+        financing = 0.0
 
         if entry_info:
             entry_price = entry_info["entry_price"]
             units = entry_info["units"]
             pnl = (exit_price - entry_price) * units
             duration = now - entry_info["entry_time"]
+            financing = entry_info.get("financing", 0.0)
 
         del self._strategy_positions[pair]
         self._exit_managers.pop(pair, None)  # Clean up ExitManager state
@@ -1069,7 +1090,7 @@ class TradingRunner:
                     else 0
                 ),
                 duration=duration,
-                swap_earned=0.0,
+                swap_earned=financing,
             )
         )
 
@@ -1082,6 +1103,7 @@ class TradingRunner:
                 "exit_price": exit_price,
                 "quantity": float(entry_info["units"] if entry_info else 0),
                 "pnl": pnl,
+                "swap_earned": financing,
                 "status": "closed",
                 "metadata": {"reason": reason},
             }
@@ -1089,10 +1111,11 @@ class TradingRunner:
 
         # Alert on trade close
         if self.alert_manager:
+            fin_str = f", carry=${financing:+.2f}" if financing != 0 else ""
             self.alert_manager.send(
                 "INFO",
                 "Trade Closed",
-                f"{pair} closed @ {exit_price:.5f}, PnL={pnl:.2f} — {reason}",
+                f"{pair} closed @ {exit_price:.5f}, PnL=${pnl:.2f}{fin_str} — {reason}",
             )
 
         self.tlogger.log_position_close(pair, pnl, reason)
@@ -1539,6 +1562,7 @@ class TradingRunner:
                     "stop_price": None,
                     "high_water_mark": pos["avg_price"],
                     "low_water_mark": pos["avg_price"],
+                    "financing": pos.get("financing", 0.0),
                 }
                 logger.info(
                     "Synced position: %s %d units @ %.5f",
@@ -1846,6 +1870,9 @@ class TradingRunner:
                 logger.info("Protocol completed: %s", report)
 
         # Send daily summary
+        total_financing = sum(
+            pos.get("financing", 0.0) for pos in self._strategy_positions.values()
+        )
         if self.alert_manager:
             self.alert_manager.send_daily_summary(
                 {
@@ -1853,6 +1880,7 @@ class TradingRunner:
                     "daily_pnl": daily_pnl,
                     "drawdown": self._max_drawdown_today,
                     "positions_count": len(self._strategy_positions),
+                    "financing": total_financing,
                 }
             )
 
