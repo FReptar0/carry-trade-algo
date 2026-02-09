@@ -39,6 +39,7 @@ PAIR_TICKERS: dict[str, str] = {
     "EUR/JPY": "EURJPY=X",
     "GBP/JPY": "GBPJPY=X",
     "NZD/JPY": "NZDJPY=X",
+    "CAD/JPY": "CADJPY=X",
 }
 
 # FRED series IDs for central bank policy rates
@@ -246,6 +247,7 @@ class HistoricalDataLoader:
             "EUR/JPY": 0.035,   # ECB ~4% vs BOJ ~0%
             "GBP/JPY": 0.05,    # BOE ~5% vs BOJ ~0%
             "NZD/JPY": 0.05,    # RBNZ ~5% vs BOJ ~0%
+            "CAD/JPY": 0.05,    # BOC ~5% vs BOJ ~0%
         }
         diff = differentials.get(pair, 0.0)
         swap_long = round(diff / 365 * 100, 4)

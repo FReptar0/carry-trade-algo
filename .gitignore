@@ -11,10 +11,8 @@ build/
 .vscode/
 *.swp
 
-# Data
-data/raw/*.csv
-data/raw/*.parquet
-data/cache/
+# Data (runtime directory at repo root)
+/data/
 
 # Results
 results/logs/
