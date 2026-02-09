@@ -20,6 +20,7 @@ Tick workflow (every hour):
 10. Update performance monitor
 11. Check circuit breakers
 12. Check protocol abort conditions
+12b. Update broker-side stop-losses (trailing / ratchet)
 13. Save state to SQLite
 14. Watchdog heartbeat
 15. Log tick summary
@@ -95,9 +96,7 @@ class RunnerConfig:
         enable_scaling: Enable scale-in/scale-out.
     """
 
-    pairs: list[str] = field(
-        default_factory=lambda: ["USD/JPY", "AUD/JPY"]
-    )
+    pairs: list[str] = field(default_factory=lambda: ["USD/JPY", "AUD/JPY"])
     check_interval_minutes: int = 60
     candle_lookback: int = 300
     position_size_units: int = 10000
@@ -153,9 +152,7 @@ class TradingRunner:
                 datetime.now(UTC)
             ),
         )
-        self.reconciler = Reconciler(
-            alert_manager=self.alert_manager
-        )
+        self.reconciler = Reconciler(alert_manager=self.alert_manager)
         self._last_market_state: bool = True  # Track market open/close
         self.calendar = self._init_calendar()
 
@@ -169,16 +166,12 @@ class TradingRunner:
             cross_asset_fetcher=self._cross_asset_fetcher
         )
         self.bandit = SignalBandit(n_features=len(FEATURE_NAMES))
-        self.shadow_evaluator = ShadowEvaluator(
-            min_trades=50, min_advantage=0.1
-        )
+        self.shadow_evaluator = ShadowEvaluator(min_trades=50, min_advantage=0.1)
         self._bandit_active = False
         self._load_bandit_model()
 
         # Phase D: Advanced risk management
-        self.dynamic_sizer = DynamicSizer(
-            base_units=self.config.position_size_units
-        )
+        self.dynamic_sizer = DynamicSizer(base_units=self.config.position_size_units)
         self.correlation_monitor = CorrelationMonitor(lookback=60)
         self.scale_manager = ScaleManager()
 
@@ -189,9 +182,7 @@ class TradingRunner:
         self.protocol = self._restore_or_create_protocol()
 
         # Performance monitor
-        self.monitor = PerformanceMonitor(
-            initial_equity=self.config.initial_equity
-        )
+        self.monitor = PerformanceMonitor(initial_equity=self.config.initial_equity)
 
         # Daily tracking
         self._today: Optional[date] = None
@@ -206,12 +197,8 @@ class TradingRunner:
 
     def _init_alert_manager(self) -> Optional[AlertManager]:
         """Initialize AlertManager if Telegram credentials exist."""
-        token = self.config.telegram_bot_token or os.getenv(
-            "TELEGRAM_BOT_TOKEN", ""
-        )
-        chat_id = self.config.telegram_chat_id or os.getenv(
-            "TELEGRAM_CHAT_ID", ""
-        )
+        token = self.config.telegram_bot_token or os.getenv("TELEGRAM_BOT_TOKEN", "")
+        chat_id = self.config.telegram_chat_id or os.getenv("TELEGRAM_CHAT_ID", "")
         if token and chat_id:
             return AlertManager(
                 AlertConfig(
@@ -237,8 +224,7 @@ class TradingRunner:
             return cal
         except Exception as e:
             logger.warning(
-                "Failed to init LiveCalendar: %s, "
-                "falling back to static",
+                "Failed to init LiveCalendar: %s, falling back to static",
                 e,
             )
 
@@ -259,14 +245,11 @@ class TradingRunner:
                 # Guard: reinitialize if loaded model has wrong n_features
                 if self.bandit.n_features != len(FEATURE_NAMES):
                     logger.warning(
-                        "Bandit n_features mismatch (%d vs %d), "
-                        "reinitializing",
+                        "Bandit n_features mismatch (%d vs %d), reinitializing",
                         self.bandit.n_features,
                         len(FEATURE_NAMES),
                     )
-                    self.bandit = SignalBandit(
-                        n_features=len(FEATURE_NAMES)
-                    )
+                    self.bandit = SignalBandit(n_features=len(FEATURE_NAMES))
                     return
                 self._bandit_active = True
                 logger.info(
@@ -336,8 +319,7 @@ class TradingRunner:
             self.alert_manager.send(
                 "WARNING",
                 "System Startup",
-                f"Trading runner started with pairs: "
-                f"{self.config.pairs}",
+                f"Trading runner started with pairs: {self.config.pairs}",
             )
 
         # Register signal handlers for graceful shutdown
@@ -385,9 +367,7 @@ class TradingRunner:
         # Phase B: Weekly optimization (Sunday 00:00 UTC)
         self.scheduler.add_job(
             self._weekly_optimization,
-            CronTrigger(
-                day_of_week="sun", hour=0, minute=0, timezone=UTC
-            ),
+            CronTrigger(day_of_week="sun", hour=0, minute=0, timezone=UTC),
             id="weekly_optimization",
             name="Weekly param optimization",
             max_instances=1,
@@ -396,9 +376,7 @@ class TradingRunner:
         # Phase E: Weekly retraining (Sunday 02:00 UTC)
         self.scheduler.add_job(
             self._weekly_retraining,
-            CronTrigger(
-                day_of_week="sun", hour=2, minute=0, timezone=UTC
-            ),
+            CronTrigger(day_of_week="sun", hour=2, minute=0, timezone=UTC),
             id="weekly_retraining",
             name="Weekly model retraining",
             max_instances=1,
@@ -416,9 +394,7 @@ class TradingRunner:
         # Weekly report (Sunday 08:00 UTC)
         self.scheduler.add_job(
             self._send_weekly_report,
-            CronTrigger(
-                day_of_week="sun", hour=8, minute=0, timezone=UTC
-            ),
+            CronTrigger(day_of_week="sun", hour=8, minute=0, timezone=UTC),
             id="weekly_report",
             name="Weekly performance report",
             max_instances=1,
@@ -553,9 +529,7 @@ class TradingRunner:
             weekly_pnl=daily_pnl,  # Simplified for now
             open_positions=pos_count,
         )
-        violations = self.circuit_breaker.check_limits(
-            portfolio_state, now
-        )
+        violations = self.circuit_breaker.check_limits(portfolio_state, now)
         if violations:
             self._cb_triggered_today = True
             for v in violations:
@@ -569,15 +543,11 @@ class TradingRunner:
 
         # 10. Track drawdown
         snapshot = self.monitor.get_snapshot()
-        self._max_drawdown_today = max(
-            self._max_drawdown_today, snapshot.drawdown
-        )
+        self._max_drawdown_today = max(self._max_drawdown_today, snapshot.drawdown)
 
         # 11. Check protocol abort
         if self.protocol.days:
-            should_abort, reason = (
-                self.protocol.check_abort_conditions()
-            )
+            should_abort, reason = self.protocol.check_abort_conditions()
             if should_abort and reason:
                 logger.critical("Protocol abort: %s", reason)
                 if self.alert_manager:
@@ -591,6 +561,12 @@ class TradingRunner:
                 self.store.save_protocol_state(self.protocol)
                 self.stop(f"Protocol abort: {reason}")
                 return
+
+        # 11b. Update broker-side stop-losses (trailing / ratchet)
+        try:
+            self._update_stop_losses()
+        except Exception as e:
+            logger.error("Stop-loss update sweep failed: %s", e)
 
         # 12. Save equity snapshot
         self.store.save_equity_snapshot(
@@ -678,15 +654,11 @@ class TradingRunner:
         if last_signal.signal == Signal.LONG and not has_position:
             # New entry signal
             if in_blackout:
-                logger.info(
-                    "Skipping entry for %s (blackout)", pair
-                )
+                logger.info("Skipping entry for %s (blackout)", pair)
                 return
 
             if self.circuit_breaker.is_trading_halted:
-                logger.info(
-                    "Skipping entry for %s (circuit breaker)", pair
-                )
+                logger.info("Skipping entry for %s (circuit breaker)", pair)
                 return
 
             # Phase C: Signal filter
@@ -698,17 +670,14 @@ class TradingRunner:
                 if self._bandit_active:
                     if action == "SKIP":
                         logger.info(
-                            "Signal filtered for %s (bandit: SKIP, "
-                            "conf=%.3f)",
+                            "Signal filtered for %s (bandit: SKIP, conf=%.3f)",
                             pair,
                             confidence,
                         )
                         return
                 # Shadow mode: log but don't block
 
-            self._open_position(
-                pair, last_signal.reason, now, df, equity
-            )
+            self._open_position(pair, last_signal.reason, now, df, equity)
 
         elif last_signal.signal == Signal.CLOSE and has_position:
             # Exit signal
@@ -722,24 +691,33 @@ class TradingRunner:
         df: Optional[pd.DataFrame] = None,
         equity: float = 0.0,
     ) -> None:
-        """Open a new position via OANDA.
+        """Open a new position via OANDA with a broker-side stop-loss.
 
         Args:
             pair: Currency pair.
             reason: Entry reason from strategy.
             now: Current time.
-            df: Candle data for dynamic sizing.
+            df: Candle data for dynamic sizing and stop calculation.
             equity: Current account equity.
         """
         self.tlogger.log_signal(pair, "LONG", reason)
 
+        # Calculate ATR for stop-loss (always needed, even without
+        # dynamic sizing). Falls back to a conservative default.
+        from src.strategy.indicators import atr as calc_atr
+
+        current_atr = 0.5  # Conservative fallback
+        current_close = 0.0
+        if df is not None and len(df) > 20:
+            atr_vals = calc_atr(df["high"], df["low"], df["close"])
+            last_atr = atr_vals.iloc[-1]
+            if not np.isnan(last_atr):
+                current_atr = float(last_atr)
+            current_close = float(df["close"].iloc[-1])
+
         # Phase D: Dynamic position sizing
         if self.config.enable_dynamic_sizing and df is not None and equity > 0:
-            from src.strategy.indicators import atr as calc_atr
-
-            atr_vals = calc_atr(df["high"], df["low"], df["close"])
-            current_atr = float(atr_vals.iloc[-1]) if not np.isnan(atr_vals.iloc[-1]) else 0.5
-            price = float(df["close"].iloc[-1])
+            price = current_close
 
             # Get performance stats for Kelly
             stats = self.monitor.get_snapshot()
@@ -768,10 +746,19 @@ class TradingRunner:
         else:
             units = self.config.position_size_units
 
+        # Calculate broker-side stop-loss price (3x ATR below entry)
+        # Uses current close as proxy — the few pips of slippage are
+        # negligible vs 3x ATR stop width (~3-4% on JPY pairs).
+        atr_stop_mult = self.strategy.config.atr_stop_mult
+        stop_loss_price = None
+        if current_close > 0 and current_atr > 0:
+            stop_loss_price = round(current_close - (current_atr * atr_stop_mult), 3)
+
         order = self.broker.submit_market_order(
             pair=pair,
             side=OrderSide.BUY,
             units=units,
+            stop_loss_price=stop_loss_price,
         )
 
         if order is None or order.avg_fill_price is None:
@@ -784,6 +771,9 @@ class TradingRunner:
             "units": units,
             "tranche_count": 1,
             "levels_taken": 0,
+            "trade_id": order.trade_id,
+            "stop_price": stop_loss_price,
+            "high_water_mark": order.avg_fill_price,
         }
         self._trades_opened_today += 1
 
@@ -795,7 +785,11 @@ class TradingRunner:
                 "entry_price": order.avg_fill_price,
                 "quantity": float(units),
                 "status": "open",
-                "metadata": {"reason": reason},
+                "metadata": {
+                    "reason": reason,
+                    "trade_id": order.trade_id,
+                    "stop_price": stop_loss_price,
+                },
             }
         )
 
@@ -805,21 +799,22 @@ class TradingRunner:
                 "INFO",
                 "Trade Opened",
                 f"{pair} LONG {units} units @ "
-                f"{order.avg_fill_price:.5f} — {reason}",
+                f"{order.avg_fill_price:.5f} "
+                f"(stop={stop_loss_price:.3f}) — {reason}",
             )
 
         self.tlogger.log_order(order.to_dict())
         logger.info(
-            "Opened %s %d units @ %.5f — %s",
+            "Opened %s %d units @ %.5f (stop=%.3f, trade_id=%s) — %s",
             pair,
             units,
             order.avg_fill_price,
+            stop_loss_price or 0.0,
+            order.trade_id or "N/A",
             reason,
         )
 
-    def _close_position(
-        self, pair: str, reason: str, now: datetime
-    ) -> None:
+    def _close_position(self, pair: str, reason: str, now: datetime) -> None:
         """Close an existing position via OANDA.
 
         Args:
@@ -867,12 +862,8 @@ class TradingRunner:
             try:
                 cached_df = self._candle_cache.get(pair)
                 if cached_df is not None:
-                    features = self.feature_extractor.extract(
-                        cached_df, pair
-                    )
-                    feat_array = self.feature_extractor.to_array(
-                        features
-                    )
+                    features = self.feature_extractor.extract(cached_df, pair)
+                    feat_array = self.feature_extractor.to_array(features)
                     # Normalize PnL for reward
                     reward = np.clip(pnl / 1000.0, -1.0, 1.0)
                     self.bandit.update(feat_array, "TAKE", reward)
@@ -880,17 +871,11 @@ class TradingRunner:
                     # Shadow evaluation
                     if not self._bandit_active:
                         action, _ = self.bandit.decide(feat_array)
-                        self.shadow_evaluator.record(
-                            feat_array, action, pnl
-                        )
-                        should_activate, stats = (
-                            self.shadow_evaluator.should_activate()
-                        )
+                        self.shadow_evaluator.record(feat_array, action, pnl)
+                        should_activate, stats = self.shadow_evaluator.should_activate()
                         if should_activate:
                             self._bandit_active = True
-                            logger.info(
-                                "Bandit activated: %s", stats
-                            )
+                            logger.info("Bandit activated: %s", stats)
             except Exception as e:
                 logger.debug("Bandit update failed: %s", e)
 
@@ -900,17 +885,12 @@ class TradingRunner:
                 timestamp=now,
                 pair=pair,
                 side="BUY",
-                entry_price=entry_info["entry_price"]
-                if entry_info
-                else 0,
+                entry_price=entry_info["entry_price"] if entry_info else 0,
                 exit_price=exit_price,
-                quantity=float(
-                    entry_info["units"] if entry_info else 0
-                ),
+                quantity=float(entry_info["units"] if entry_info else 0),
                 pnl=pnl,
                 pnl_pct=(
-                    pnl
-                    / (entry_info["entry_price"] * entry_info["units"])
+                    pnl / (entry_info["entry_price"] * entry_info["units"])
                     if entry_info
                     else 0
                 ),
@@ -924,13 +904,9 @@ class TradingRunner:
                 "timestamp": now.isoformat(),
                 "pair": pair,
                 "side": "SELL",
-                "entry_price": entry_info["entry_price"]
-                if entry_info
-                else 0,
+                "entry_price": entry_info["entry_price"] if entry_info else 0,
                 "exit_price": exit_price,
-                "quantity": float(
-                    entry_info["units"] if entry_info else 0
-                ),
+                "quantity": float(entry_info["units"] if entry_info else 0),
                 "pnl": pnl,
                 "status": "closed",
                 "metadata": {"reason": reason},
@@ -942,8 +918,7 @@ class TradingRunner:
             self.alert_manager.send(
                 "INFO",
                 "Trade Closed",
-                f"{pair} closed @ {exit_price:.5f}, "
-                f"PnL={pnl:.2f} — {reason}",
+                f"{pair} closed @ {exit_price:.5f}, PnL={pnl:.2f} — {reason}",
             )
 
         self.tlogger.log_position_close(pair, pnl, reason)
@@ -955,9 +930,7 @@ class TradingRunner:
             reason,
         )
 
-    def _check_scaling(
-        self, pair: str, df: pd.DataFrame
-    ) -> None:
+    def _check_scaling(self, pair: str, df: pd.DataFrame) -> None:
         """Check for scale-in/scale-out opportunities.
 
         Args:
@@ -978,14 +951,18 @@ class TradingRunner:
             return
 
         # Check scale-in
-        if self.scale_manager.should_add(
-            position, current_price, current_atr
-        ):
-            add_units = self.scale_manager.tranche_units(
-                position["units"]
-            )
+        if self.scale_manager.should_add(position, current_price, current_atr):
+            add_units = self.scale_manager.tranche_units(position["units"])
+
+            # Calculate broker-side stop for the new tranche
+            atr_stop_mult = self.strategy.config.atr_stop_mult
+            scale_stop = round(current_price - (current_atr * atr_stop_mult), 3)
+
             order = self.broker.submit_market_order(
-                pair=pair, side=OrderSide.BUY, units=add_units
+                pair=pair,
+                side=OrderSide.BUY,
+                units=add_units,
+                stop_loss_price=scale_stop,
             )
             if order and order.avg_fill_price:
                 # Update average entry price
@@ -995,20 +972,29 @@ class TradingRunner:
                     + order.avg_fill_price * add_units
                 ) / total_units
                 position["units"] = total_units
-                position["tranche_count"] = (
-                    position.get("tranche_count", 1) + 1
-                )
+                position["tranche_count"] = position.get("tranche_count", 1) + 1
+
+                # Track all trade_ids for the position; the first
+                # remains the "primary" used by _update_stop_losses.
+                trade_ids = position.get("trade_ids", [])
+                if position.get("trade_id") and position["trade_id"] not in trade_ids:
+                    trade_ids.append(position["trade_id"])
+                if order.trade_id:
+                    trade_ids.append(order.trade_id)
+                position["trade_ids"] = trade_ids
+
                 logger.info(
-                    "Scaled in %s: +%d units (total %d)",
+                    "Scaled in %s: +%d units @ %.5f (stop=%.3f, trade_id=%s, total %d)",
                     pair,
                     add_units,
+                    order.avg_fill_price,
+                    scale_stop,
+                    order.trade_id or "N/A",
                     total_units,
                 )
 
         # Check scale-out (partial profit)
-        elif self.scale_manager.should_reduce(
-            position, current_price, current_atr
-        ):
+        elif self.scale_manager.should_reduce(position, current_price, current_atr):
             level_idx = position.get("levels_taken", 0)
             reduce_units = self.scale_manager.reduction_units(
                 position["units"], level_idx
@@ -1016,9 +1002,7 @@ class TradingRunner:
             if reduce_units > 0 and reduce_units < position["units"]:
                 # Use partial position close (not a SELL order) to
                 # reduce the position through OANDA's position endpoint.
-                order = self.broker.close_position(
-                    pair=pair, units=reduce_units
-                )
+                order = self.broker.close_position(pair=pair, units=reduce_units)
                 if order and order.avg_fill_price:
                     position["units"] -= reduce_units
                     position["levels_taken"] = level_idx + 1
@@ -1026,8 +1010,7 @@ class TradingRunner:
                         order.avg_fill_price - position["entry_price"]
                     ) * reduce_units
                     logger.info(
-                        "Scaled out %s: -%d units (PnL=%.2f, "
-                        "remaining %d)",
+                        "Scaled out %s: -%d units (PnL=%.2f, remaining %d)",
                         pair,
                         reduce_units,
                         partial_pnl,
@@ -1042,17 +1025,22 @@ class TradingRunner:
             try:
                 self._close_position(pair, reason, now)
             except Exception as e:
-                logger.error(
-                    "Failed to close %s during abort: %s", pair, e
-                )
+                logger.error("Failed to close %s during abort: %s", pair, e)
 
     def _sync_positions(self) -> None:
-        """Sync internal state with OANDA's actual positions."""
+        """Sync internal state with OANDA's actual positions and trades.
+
+        On startup, fetches both position-level data (for sizing) and
+        trade-level data (for trade_ids and stop-loss state). For any
+        trade that lacks a broker-side stop-loss, calculates and attaches
+        one using 3x ATR from current candle data.
+        """
         positions = self.broker.get_all_positions()
         if positions is None:
             logger.warning("Could not sync positions from OANDA")
             return
 
+        # Build position dict from aggregated positions
         for pos in positions:
             pair = pos["pair"]
             if pair in [p for p in self.config.pairs]:
@@ -1062,6 +1050,9 @@ class TradingRunner:
                     "units": pos["units"],
                     "tranche_count": 1,
                     "levels_taken": 0,
+                    "trade_id": None,
+                    "stop_price": None,
+                    "high_water_mark": pos["avg_price"],
                 }
                 logger.info(
                     "Synced position: %s %d units @ %.5f",
@@ -1069,6 +1060,197 @@ class TradingRunner:
                     pos["units"],
                     pos["avg_price"],
                 )
+
+        # Fetch trade-level data for trade_ids and stop-loss state
+        open_trades = self.broker.get_open_trades()
+        if open_trades is None:
+            logger.warning("Could not fetch open trades for sync")
+            return
+
+        # Map trades to positions (use first trade per pair for simplicity;
+        # multiple trades per pair can exist from scale-in)
+        for trade in open_trades:
+            pair = trade["pair"]
+            pos = self._strategy_positions.get(pair)
+            if pos is None:
+                continue
+
+            # Store the trade_id (first trade for this pair wins)
+            if pos.get("trade_id") is None:
+                pos["trade_id"] = trade["trade_id"]
+
+            # Update HWM: use current price if above entry
+            current_price = trade["price"] + (
+                trade["unrealized_pnl"] / max(abs(trade["units"]), 1)
+            )
+            if current_price > pos.get("high_water_mark", 0):
+                pos["high_water_mark"] = current_price
+
+            # Check if this trade already has a broker-side stop
+            if trade["stop_loss_price"] is not None:
+                pos["stop_price"] = trade["stop_loss_price"]
+                logger.info(
+                    "Trade %s (%s) has stop @ %.3f",
+                    trade["trade_id"],
+                    pair,
+                    trade["stop_loss_price"],
+                )
+            else:
+                # No broker-side stop — attach one immediately
+                self._attach_initial_stop(pair, trade["trade_id"], pos)
+
+    def _attach_initial_stop(self, pair: str, trade_id: str, pos: dict) -> None:
+        """Calculate and attach a 3x ATR stop to an unprotected trade.
+
+        Args:
+            pair: Currency pair.
+            trade_id: OANDA trade ID.
+            pos: Internal position dict (mutated with stop_price).
+        """
+        from src.strategy.indicators import atr as calc_atr
+
+        df = self.broker.fetch_candles(pair, count=50, granularity="H1")
+        if df is None or len(df) < 20:
+            logger.error(
+                "Cannot calc stop for %s (insufficient candle data)",
+                pair,
+            )
+            return
+
+        atr_vals = calc_atr(df["high"], df["low"], df["close"])
+        current_atr = float(atr_vals.iloc[-1])
+        if np.isnan(current_atr) or current_atr <= 0:
+            logger.error("Invalid ATR for %s, cannot set stop", pair)
+            return
+
+        atr_mult = self.strategy.config.atr_stop_mult
+        current_price = float(df["close"].iloc[-1])
+        stop_price = round(current_price - (current_atr * atr_mult), 3)
+
+        success = self.broker.modify_trade_stop_loss(
+            trade_id=trade_id,
+            stop_price=stop_price,
+        )
+        if success:
+            pos["stop_price"] = stop_price
+            logger.info(
+                "Attached stop to %s (trade %s): %.3f "
+                "(price=%.3f, ATR=%.3f, mult=%.1f)",
+                pair,
+                trade_id,
+                stop_price,
+                current_price,
+                current_atr,
+                atr_mult,
+            )
+            if self.alert_manager:
+                self.alert_manager.send(
+                    "INFO",
+                    "Stop Attached",
+                    f"Broker-side stop set on {pair} (trade {trade_id})"
+                    f" @ {stop_price:.3f}",
+                )
+        else:
+            logger.error(
+                "Failed to attach stop to %s (trade %s)",
+                pair,
+                trade_id,
+            )
+
+    def _update_stop_losses(self) -> None:
+        """Update broker-side stop-losses for all open positions.
+
+        For each position:
+        - Updates the high-water mark from current candle data
+        - If profit >= trailing_activation_pct: trail by trailing_atr_mult × ATR
+        - Otherwise: keep initial 3x ATR stop from entry
+        - Stops only ratchet upward (tighten) — never move down
+
+        Called at the end of each tick. Failures are logged but do not
+        propagate, so a broker timeout on one pair doesn't crash the tick.
+        """
+        from src.strategy.indicators import atr as calc_atr
+
+        trailing_activation = self.strategy.config.trailing_activation_pct
+        trailing_mult = self.strategy.config.trailing_atr_mult
+        initial_mult = self.strategy.config.atr_stop_mult
+
+        for pair, pos in self._strategy_positions.items():
+            try:
+                trade_id = pos.get("trade_id")
+                if trade_id is None:
+                    logger.debug("No trade_id for %s, skipping stop update", pair)
+                    continue
+
+                # Get current candle data from cache (populated earlier in tick)
+                df = self._candle_cache.get(pair)
+                if df is None or len(df) < 20:
+                    logger.debug("No cached candles for %s, skipping stop update", pair)
+                    continue
+
+                current_price = float(df["close"].iloc[-1])
+                entry_price = pos.get("entry_price", 0)
+                current_stop = pos.get("stop_price")
+
+                # Update high-water mark
+                hwm = pos.get("high_water_mark", entry_price)
+                if current_price > hwm:
+                    pos["high_water_mark"] = current_price
+                    hwm = current_price
+
+                # Calculate current ATR
+                atr_vals = calc_atr(df["high"], df["low"], df["close"])
+                current_atr = float(atr_vals.iloc[-1])
+                if np.isnan(current_atr) or current_atr <= 0:
+                    continue
+
+                # Determine which stop regime applies
+                if entry_price > 0:
+                    profit_pct = (current_price - entry_price) / entry_price
+                else:
+                    profit_pct = 0.0
+
+                if profit_pct >= trailing_activation:
+                    # Trailing mode: 2x ATR below high-water mark
+                    new_stop = round(hwm - (current_atr * trailing_mult), 3)
+                else:
+                    # Initial mode: 3x ATR below current price
+                    # (slides up with price, but never down)
+                    new_stop = round(current_price - (current_atr * initial_mult), 3)
+
+                # Ratchet: only update if new stop is ABOVE current stop
+                if current_stop is not None and new_stop <= current_stop:
+                    continue
+
+                # Update broker
+                success = self.broker.modify_trade_stop_loss(
+                    trade_id=trade_id,
+                    stop_price=new_stop,
+                )
+                if success:
+                    old_stop = current_stop or 0.0
+                    pos["stop_price"] = new_stop
+                    mode = "TRAIL" if profit_pct >= trailing_activation else "INITIAL"
+                    logger.info(
+                        "Stop updated %s [%s]: %.3f → %.3f "
+                        "(price=%.3f, HWM=%.3f, profit=%.2f%%)",
+                        pair,
+                        mode,
+                        old_stop,
+                        new_stop,
+                        current_price,
+                        hwm,
+                        profit_pct * 100,
+                    )
+                else:
+                    logger.warning(
+                        "Failed to update stop for %s (trade %s)",
+                        pair,
+                        trade_id,
+                    )
+
+            except Exception as e:
+                logger.error("Error updating stop for %s: %s", pair, e)
 
     def _check_new_day(self, now: datetime) -> None:
         """Handle day transitions."""
@@ -1103,9 +1285,7 @@ class TradingRunner:
         ending_equity = acct["equity"]
         daily_pnl = ending_equity - self._day_start_equity
         daily_return = (
-            daily_pnl / self._day_start_equity
-            if self._day_start_equity > 0
-            else 0
+            daily_pnl / self._day_start_equity if self._day_start_equity > 0 else 0
         )
 
         day = ProtocolDay(
@@ -1169,9 +1349,7 @@ class TradingRunner:
                     "equity": ending_equity,
                     "daily_pnl": daily_pnl,
                     "drawdown": self._max_drawdown_today,
-                    "positions_count": len(
-                        self._strategy_positions
-                    ),
+                    "positions_count": len(self._strategy_positions),
                 }
             )
 
@@ -1227,10 +1405,14 @@ class TradingRunner:
             if self.alert_manager:
                 positions = self.broker.get_all_positions() or []
                 acct = self.broker.get_account_state() or {}
-                pos_summary = "\n".join(
-                    f"  {p['pair']}: {p['units']}u, PnL: ${p['unrealized_pnl']:.2f}"
-                    for p in positions
-                ) if positions else "  No open positions"
+                pos_summary = (
+                    "\n".join(
+                        f"  {p['pair']}: {p['units']}u, PnL: ${p['unrealized_pnl']:.2f}"
+                        for p in positions
+                    )
+                    if positions
+                    else "  No open positions"
+                )
 
                 self.alert_manager.send(
                     "INFO",
@@ -1248,10 +1430,14 @@ class TradingRunner:
             if self.alert_manager:
                 positions = self.broker.get_all_positions() or []
                 acct = self.broker.get_account_state() or {}
-                pos_summary = "\n".join(
-                    f"  {p['pair']}: {p['units']}u, PnL: ${p['unrealized_pnl']:.2f}"
-                    for p in positions
-                ) if positions else "  No open positions"
+                pos_summary = (
+                    "\n".join(
+                        f"  {p['pair']}: {p['units']}u, PnL: ${p['unrealized_pnl']:.2f}"
+                        for p in positions
+                    )
+                    if positions
+                    else "  No open positions"
+                )
 
                 self.alert_manager.send(
                     "INFO",
@@ -1279,18 +1465,14 @@ class TradingRunner:
             # Fetch recent candles for all pairs
             recent_candles = {}
             for pair in self.config.pairs:
-                df = self.broker.fetch_candles(
-                    pair, count=720, granularity="H1"
-                )
+                df = self.broker.fetch_candles(pair, count=720, granularity="H1")
                 if df is not None and len(df) >= 220:
                     df["swap_long"] = self.config.swap_long_default
                     df["swap_short"] = self.config.swap_short_default
                     recent_candles[pair] = df
 
             if not recent_candles:
-                logger.warning(
-                    "No candle data for optimization, skipping"
-                )
+                logger.warning("No candle data for optimization, skipping")
                 return
 
             # Optimize each regime
@@ -1318,9 +1500,7 @@ class TradingRunner:
                 )
 
         except ImportError as e:
-            logger.warning(
-                "Optimization skipped (missing dependency): %s", e
-            )
+            logger.warning("Optimization skipped (missing dependency): %s", e)
         except Exception as e:
             logger.error("Weekly optimization failed: %s", e)
 
@@ -1336,14 +1516,13 @@ class TradingRunner:
 
             # Get recent trades
             trades = self.store.get_trades()
-            recent = [
-                t for t in trades if t.get("status") == "closed"
-            ][-100:]  # Last 100 closed trades
+            recent = [t for t in trades if t.get("status") == "closed"][
+                -100:
+            ]  # Last 100 closed trades
 
             if len(recent) < 10:
                 logger.info(
-                    "Not enough recent trades for retraining "
-                    "(%d < 10)",
+                    "Not enough recent trades for retraining (%d < 10)",
                     len(recent),
                 )
                 return
@@ -1391,9 +1570,7 @@ class TradingRunner:
             account = self.broker.get_account_state() or {}
 
             report.open_positions = len(positions)
-            report.unrealized_pnl = sum(
-                p.get("unrealized_pnl", 0) for p in positions
-            )
+            report.unrealized_pnl = sum(p.get("unrealized_pnl", 0) for p in positions)
 
             msg = format_daily_report(report, positions, account, progress)
 

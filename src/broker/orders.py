@@ -31,6 +31,7 @@ import uuid
 
 class OrderType(Enum):
     """Type of order."""
+
     MARKET = auto()  # Execute at current price
     LIMIT = auto()  # Execute at target price or better
     STOP = auto()  # Trigger market when price hits stop
@@ -39,12 +40,14 @@ class OrderType(Enum):
 
 class OrderSide(Enum):
     """Buy or sell."""
+
     BUY = auto()
     SELL = auto()
 
 
 class OrderStatus(Enum):
     """Order lifecycle status."""
+
     PENDING = auto()  # Created, not yet submitted
     SUBMITTED = auto()  # Sent to broker, awaiting fill
     PARTIALLY_FILLED = auto()  # Some quantity filled
@@ -60,6 +63,7 @@ class Fill:
 
     A single order can have multiple fills (partial fills).
     """
+
     fill_id: str
     order_id: str
     timestamp: datetime
@@ -92,6 +96,7 @@ class Order:
         filled_at: When order was fully filled
         fills: List of fills (partial or full)
     """
+
     pair: str
     side: OrderSide
     order_type: OrderType
@@ -105,6 +110,7 @@ class Order:
     filled_at: Optional[datetime] = None
     fills: list[Fill] = field(default_factory=list)
     reject_reason: Optional[str] = None
+    trade_id: Optional[str] = None  # OANDA trade ID for stop-loss mgmt
 
     @property
     def filled_quantity(self) -> float:
@@ -137,11 +143,19 @@ class Order:
 
     def is_active(self) -> bool:
         """Check if order is still active (could be filled)."""
-        return self.status in (OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.PARTIALLY_FILLED)
+        return self.status in (
+            OrderStatus.PENDING,
+            OrderStatus.SUBMITTED,
+            OrderStatus.PARTIALLY_FILLED,
+        )
 
     def can_cancel(self) -> bool:
         """Check if order can be cancelled."""
-        return self.status in (OrderStatus.PENDING, OrderStatus.SUBMITTED, OrderStatus.PARTIALLY_FILLED)
+        return self.status in (
+            OrderStatus.PENDING,
+            OrderStatus.SUBMITTED,
+            OrderStatus.PARTIALLY_FILLED,
+        )
 
     def to_dict(self) -> dict:
         """Convert to dictionary for logging."""
@@ -158,6 +172,7 @@ class Order:
             "filled_quantity": self.filled_quantity,
             "avg_fill_price": self.avg_fill_price,
             "total_commission": self.total_commission,
+            "trade_id": self.trade_id,
         }
 
 
@@ -167,6 +182,7 @@ class Position:
 
     Tracks entry, current P&L, and accumulated swap.
     """
+
     pair: str
     side: OrderSide
     quantity: float

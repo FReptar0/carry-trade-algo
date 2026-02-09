@@ -27,6 +27,11 @@ import oandapyV20.endpoints.instruments as instruments
 import oandapyV20.endpoints.orders as orders_api
 import oandapyV20.endpoints.positions as positions_api
 import oandapyV20.endpoints.pricing as pricing
+import oandapyV20.endpoints.trades as trades_api
+from oandapyV20.contrib.requests import (
+    MarketOrderRequest,
+    StopLossDetails,
+)
 
 from src.broker.orders import Fill, Order, OrderSide, OrderStatus, OrderType
 
@@ -50,9 +55,7 @@ class OandaConfig:
     access_token: str
     account_id: str
     environment: str = "practice"
-    instruments: list[str] = field(
-        default_factory=lambda: ["USD_JPY", "AUD_JPY"]
-    )
+    instruments: list[str] = field(default_factory=lambda: ["USD_JPY", "AUD_JPY"])
 
     def __post_init__(self) -> None:
         if self.environment != "practice":
@@ -86,10 +89,9 @@ def _retry(func):
                 if "401" in str(e) or "403" in str(e):
                     logger.critical("OANDA auth error: %s", e)
                     raise
-                wait = BACKOFF_BASE ** attempt
+                wait = BACKOFF_BASE**attempt
                 logger.warning(
-                    "OANDA API error (attempt %d/%d): %s. "
-                    "Retrying in %.1fs",
+                    "OANDA API error (attempt %d/%d): %s. Retrying in %.1fs",
                     attempt + 1,
                     MAX_RETRIES,
                     e,
@@ -98,10 +100,9 @@ def _retry(func):
                 time.sleep(wait)
             except Exception as e:
                 last_exc = e
-                wait = BACKOFF_BASE ** attempt
+                wait = BACKOFF_BASE**attempt
                 logger.warning(
-                    "Unexpected error (attempt %d/%d): %s. "
-                    "Retrying in %.1fs",
+                    "Unexpected error (attempt %d/%d): %s. Retrying in %.1fs",
                     attempt + 1,
                     MAX_RETRIES,
                     e,
@@ -168,9 +169,7 @@ class OandaBroker:
             "price": "M",  # Mid prices
         }
 
-        endpoint = instruments.InstrumentsCandles(
-            instrument=instrument, params=params
-        )
+        endpoint = instruments.InstrumentsCandles(instrument=instrument, params=params)
         response = self.client.request(endpoint)
         candles = response.get("candles", [])
 
@@ -198,15 +197,11 @@ class OandaBroker:
             return None
 
         df = pd.DataFrame(rows)
-        logger.info(
-            "Fetched %d candles for %s (%s)", len(df), pair, granularity
-        )
+        logger.info("Fetched %d candles for %s (%s)", len(df), pair, granularity)
         return df
 
     @_retry
-    def get_current_price(
-        self, pair: str
-    ) -> Optional[dict[str, float]]:
+    def get_current_price(self, pair: str) -> Optional[dict[str, float]]:
         """Get current bid/ask/mid price for a pair.
 
         Args:
@@ -218,9 +213,7 @@ class OandaBroker:
         instrument = _to_oanda_instrument(pair)
         params = {"instruments": instrument}
 
-        endpoint = pricing.PricingInfo(
-            accountID=self.account_id, params=params
-        )
+        endpoint = pricing.PricingInfo(accountID=self.account_id, params=params)
         response = self.client.request(endpoint)
         prices = response.get("prices", [])
 
@@ -242,34 +235,44 @@ class OandaBroker:
         pair: str,
         side: OrderSide,
         units: int,
+        stop_loss_price: Optional[float] = None,
     ) -> Optional[Order]:
-        """Submit a market order.
+        """Submit a market order, optionally with a broker-side stop-loss.
 
         Args:
             pair: Currency pair (e.g., "USD/JPY").
             side: BUY or SELL.
             units: Number of units (positive). Converted to negative
                 for sell orders per OANDA convention.
+            stop_loss_price: If provided, OANDA attaches a stop-loss
+                order to the trade at fill time. This means the stop
+                is enforced server-side even if the bot is offline.
 
         Returns:
-            Filled Order object, or None on failure.
+            Filled Order object (with trade_id set), or None on failure.
         """
         instrument = _to_oanda_instrument(pair)
         signed_units = units if side == OrderSide.BUY else -units
 
-        data = {
-            "order": {
-                "type": "MARKET",
-                "instrument": instrument,
-                "units": str(signed_units),
-                "timeInForce": "FOK",
-                "positionFill": "DEFAULT",
-            }
-        }
+        # Build stop-loss on-fill payload if requested
+        sl_on_fill = None
+        if stop_loss_price is not None:
+            sl_on_fill = StopLossDetails(price=round(stop_loss_price, 3)).data
+            logger.info(
+                "Attaching stop-loss @ %.3f to %s order for %s",
+                stop_loss_price,
+                side.name,
+                pair,
+            )
 
-        endpoint = orders_api.OrderCreate(
-            accountID=self.account_id, data=data
+        # Use the SDK's MarketOrderRequest for clean payload construction
+        mo = MarketOrderRequest(
+            instrument=instrument,
+            units=signed_units,
+            stopLossOnFill=sl_on_fill,
         )
+
+        endpoint = orders_api.OrderCreate(accountID=self.account_id, data=mo.data)
         response = self.client.request(endpoint)
 
         fill_data = response.get("orderFillTransaction")
@@ -290,6 +293,47 @@ class OandaBroker:
         fill_price = float(fill_data["price"])
         fill_units = abs(int(fill_data["units"]))
 
+        # Extract the OANDA trade ID — needed for stop-loss updates
+        trade_id = None
+        trade_opened = fill_data.get("tradeOpened")
+        if trade_opened:
+            trade_id = str(trade_opened["tradeID"])
+
+        order = Order(
+            pair=pair,
+            side=side,
+            order_type=OrderType.MARKET,
+            quantity=float(units),
+            status=OrderStatus.FILLED,
+            filled_at=datetime.now(),
+            trade_id=trade_id,
+            fills=[
+                Fill(
+                    fill_id=fill_data["id"],
+                    order_id=fill_data.get("orderID", ""),
+                    timestamp=datetime.now(),
+                    price=fill_price,
+                    quantity=float(fill_units),
+                    commission=float(fill_data.get("commission", "0")),
+                    slippage=0.0,
+                )
+            ],
+        )
+
+        logger.info(
+            "Order filled: %s %s %d units @ %.5f (trade_id=%s, stop=%.3f)",
+            side.name,
+            pair,
+            fill_units,
+            fill_price,
+            trade_id or "N/A",
+            stop_loss_price or 0.0,
+        )
+        return order
+
+        fill_price = float(fill_data["price"])
+        fill_units = abs(int(fill_data["units"]))
+
         order = Order(
             pair=pair,
             side=side,
@@ -304,9 +348,7 @@ class OandaBroker:
                     timestamp=datetime.now(),
                     price=fill_price,
                     quantity=float(fill_units),
-                    commission=float(
-                        fill_data.get("commission", "0")
-                    ),
+                    commission=float(fill_data.get("commission", "0")),
                     slippage=0.0,
                 )
             ],
@@ -364,11 +406,7 @@ class OandaBroker:
 
         fill_price = float(fill_txn["price"])
         fill_units = abs(int(fill_txn["units"]))
-        side = (
-            OrderSide.SELL
-            if long_txn
-            else OrderSide.BUY
-        )
+        side = OrderSide.SELL if long_txn else OrderSide.BUY
 
         order = Order(
             pair=pair,
@@ -384,9 +422,7 @@ class OandaBroker:
                     timestamp=datetime.now(),
                     price=fill_price,
                     quantity=float(fill_units),
-                    commission=float(
-                        fill_txn.get("commission", "0")
-                    ),
+                    commission=float(fill_txn.get("commission", "0")),
                     slippage=0.0,
                 )
             ],
@@ -409,25 +445,17 @@ class OandaBroker:
             margin_used, margin_available, open_positions.
             Returns None on failure.
         """
-        endpoint = accounts.AccountSummary(
-            accountID=self.account_id
-        )
+        endpoint = accounts.AccountSummary(accountID=self.account_id)
         response = self.client.request(endpoint)
         acct = response.get("account", {})
 
         return {
             "balance": float(acct.get("balance", 0)),
             "equity": float(acct.get("NAV", 0)),
-            "unrealized_pnl": float(
-                acct.get("unrealizedPL", 0)
-            ),
+            "unrealized_pnl": float(acct.get("unrealizedPL", 0)),
             "margin_used": float(acct.get("marginUsed", 0)),
-            "margin_available": float(
-                acct.get("marginAvailable", 0)
-            ),
-            "open_positions": int(
-                acct.get("openPositionCount", 0)
-            ),
+            "margin_available": float(acct.get("marginAvailable", 0)),
+            "open_positions": int(acct.get("openPositionCount", 0)),
         }
 
     @_retry
@@ -439,9 +467,7 @@ class OandaBroker:
             avg_price, unrealized_pnl, financing.
             Returns None on failure.
         """
-        endpoint = positions_api.OpenPositions(
-            accountID=self.account_id
-        )
+        endpoint = positions_api.OpenPositions(accountID=self.account_id)
         response = self.client.request(endpoint)
         raw_positions = response.get("positions", [])
 
@@ -459,15 +485,9 @@ class OandaBroker:
                         "pair": pair,
                         "side": "BUY",
                         "units": long_units,
-                        "avg_price": float(
-                            pos["long"]["averagePrice"]
-                        ),
-                        "unrealized_pnl": float(
-                            pos["long"]["unrealizedPL"]
-                        ),
-                        "financing": float(
-                            pos["long"].get("financing", 0)
-                        ),
+                        "avg_price": float(pos["long"]["averagePrice"]),
+                        "unrealized_pnl": float(pos["long"]["unrealizedPL"]),
+                        "financing": float(pos["long"].get("financing", 0)),
                     }
                 )
             if short_units < 0:
@@ -476,24 +496,16 @@ class OandaBroker:
                         "pair": pair,
                         "side": "SELL",
                         "units": abs(short_units),
-                        "avg_price": float(
-                            pos["short"]["averagePrice"]
-                        ),
-                        "unrealized_pnl": float(
-                            pos["short"]["unrealizedPL"]
-                        ),
-                        "financing": float(
-                            pos["short"].get("financing", 0)
-                        ),
+                        "avg_price": float(pos["short"]["averagePrice"]),
+                        "unrealized_pnl": float(pos["short"]["unrealizedPL"]),
+                        "financing": float(pos["short"].get("financing", 0)),
                     }
                 )
 
         return result
 
     @_retry
-    def get_swap_rates(
-        self, pair: str
-    ) -> Optional[tuple[float, float]]:
+    def get_swap_rates(self, pair: str) -> Optional[tuple[float, float]]:
         """Get current financing/swap rates for a pair.
 
         Queries the OANDA v20 /accounts/{id}/instruments endpoint
@@ -527,12 +539,8 @@ class OandaBroker:
             inst = instruments_data[0]
             financing = inst.get("financing", {})
 
-            long_rate = float(
-                financing.get("longRate", "0")
-            )
-            short_rate = float(
-                financing.get("shortRate", "0")
-            )
+            long_rate = float(financing.get("longRate", "0"))
+            short_rate = float(financing.get("shortRate", "0"))
 
             # Convert from annualized to daily rate
             daily_long = long_rate / 365.0
@@ -548,9 +556,104 @@ class OandaBroker:
 
         except Exception as e:
             logger.warning(
-                "Could not fetch financing rates for %s: %s. "
-                "Returning defaults.",
+                "Could not fetch financing rates for %s: %s. Returning defaults.",
                 pair,
                 e,
             )
             return (0.0, 0.0)
+
+    @_retry
+    def get_open_trades(self) -> Optional[list[dict]]:
+        """Get all open trades with their stop-loss order info.
+
+        Unlike get_all_positions() which aggregates by instrument,
+        this returns individual trades — each with its own trade_id,
+        stop-loss state, and units. Needed for per-trade stop management.
+
+        Returns:
+            List of trade dicts with keys: trade_id, pair, units,
+            price (open price), unrealized_pnl, stop_loss_price
+            (or None if no stop). Returns None on failure.
+        """
+        endpoint = trades_api.OpenTrades(accountID=self.account_id)
+        response = self.client.request(endpoint)
+        raw_trades = response.get("trades", [])
+
+        result = []
+        for t in raw_trades:
+            sl_order = t.get("stopLossOrder")
+            sl_price = None
+            if sl_order:
+                sl_price = float(sl_order["price"])
+
+            result.append(
+                {
+                    "trade_id": str(t["id"]),
+                    "pair": _from_oanda_instrument(t["instrument"]),
+                    "units": int(t["currentUnits"]),
+                    "price": float(t["price"]),
+                    "unrealized_pnl": float(t.get("unrealizedPL", "0")),
+                    "stop_loss_price": sl_price,
+                }
+            )
+
+        return result
+
+    @_retry
+    def modify_trade_stop_loss(self, trade_id: str, stop_price: float) -> bool:
+        """Create or replace the stop-loss order on an existing trade.
+
+        Uses the OANDA TradeCRCDO (Create/Replace/Cancel Dependent
+        Orders) endpoint. If a stop-loss already exists on the trade,
+        it is atomically replaced.
+
+        Args:
+            trade_id: OANDA trade ID (from orderFillTransaction).
+            stop_price: New stop-loss trigger price. Rounded to 3
+                decimal places (appropriate for JPY pairs).
+
+        Returns:
+            True if the stop was successfully set/updated, False on
+            failure.
+        """
+        data = {
+            "stopLoss": {
+                "timeInForce": "GTC",
+                "price": f"{round(stop_price, 3):.3f}",
+            }
+        }
+
+        endpoint = trades_api.TradeCRCDO(
+            accountID=self.account_id,
+            tradeID=trade_id,
+            data=data,
+        )
+        response = self.client.request(endpoint)
+
+        # Check for successful stop-loss order creation/replacement
+        sl_txn = response.get("stopLossOrderTransaction")
+        if sl_txn:
+            logger.info(
+                "Stop-loss set on trade %s @ %.3f",
+                trade_id,
+                stop_price,
+            )
+            return True
+
+        # Check for rejection
+        sl_reject = response.get("stopLossOrderRejectTransaction")
+        if sl_reject:
+            reason = sl_reject.get("rejectReason", "unknown")
+            logger.error(
+                "Stop-loss rejected on trade %s: %s",
+                trade_id,
+                reason,
+            )
+            return False
+
+        logger.warning(
+            "Unexpected response modifying stop for trade %s: %s",
+            trade_id,
+            list(response.keys()),
+        )
+        return False
