@@ -143,6 +143,7 @@ class ExitManagerConfig:
     # Regime-based exits
     regime_exit_enabled: bool = True
     exit_on_bad_regime: bool = True
+    min_hold_days_for_regime_exit: int = 5  # Regime exits disabled until held N days
 
 
 class ExitManager:
@@ -240,9 +241,7 @@ class ExitManager:
         )
 
         # 2. Check profit-scaled trailing
-        exit_signals.append(
-            self._check_profit_scaled_trail(position, current_atr)
-        )
+        exit_signals.append(self._check_profit_scaled_trail(position, current_atr))
 
         # 3. Check time-based exit
         if self.config.time_exit_enabled:
@@ -250,9 +249,7 @@ class ExitManager:
 
         # 4. Check support break
         if self.config.use_sr_exits:
-            exit_signals.append(
-                self._check_support_break(position, price_data)
-            )
+            exit_signals.append(self._check_support_break(position, price_data))
 
         # 5. Check regime change
         if self.config.regime_exit_enabled and regime:
@@ -260,9 +257,7 @@ class ExitManager:
 
         # 6. Check trend reversal
         if weekly_trend:
-            exit_signals.append(
-                self._check_trend_reversal(position, weekly_trend)
-            )
+            exit_signals.append(self._check_trend_reversal(position, weekly_trend))
 
         # Return highest urgency exit that should exit
         should_exit_signals = [s for s in exit_signals if s.should_exit]
@@ -280,11 +275,15 @@ class ExitManager:
         """Check volatility-adjusted stop loss."""
         # Calculate historical ATR for comparison
         if len(price_data) >= self.config.vol_lookback:
-            hist_atr = atr(
-                price_data["high"],
-                price_data["low"],
-                price_data["close"],
-            ).iloc[-self.config.vol_lookback:-10].mean()
+            hist_atr = (
+                atr(
+                    price_data["high"],
+                    price_data["low"],
+                    price_data["close"],
+                )
+                .iloc[-self.config.vol_lookback : -10]
+                .mean()
+            )
         else:
             hist_atr = current_atr
 
@@ -301,7 +300,11 @@ class ExitManager:
         dynamic_stop = position.entry_price - stop_distance
 
         # Use the higher of initial stop and dynamic stop
-        effective_stop = max(self._stop_price, dynamic_stop) if self._stop_price > 0 else dynamic_stop
+        effective_stop = (
+            max(self._stop_price, dynamic_stop)
+            if self._stop_price > 0
+            else dynamic_stop
+        )
 
         if position.current_price <= effective_stop:
             return ExitSignal(
@@ -461,11 +464,16 @@ class ExitManager:
         if not self.config.exit_on_bad_regime:
             return ExitSignal(should_exit=False)
 
+        # Don't fire regime exits on young positions — carry trades need
+        # time to develop before hourly regime noise should close them.
+        if position.hold_days < self.config.min_hold_days_for_regime_exit:
+            return ExitSignal(should_exit=False)
+
         profit_pct = position.return_pct
 
-        # Exit if regime is worst case and position not very profitable
+        # Exit if regime is worst case and position is losing money
         if regime.composite_regime == CompositeRegime.RANGE_HIGH_VOL:
-            if profit_pct < 0.03:
+            if profit_pct < 0.0:
                 return ExitSignal(
                     should_exit=True,
                     exit_type=ExitType.REGIME_CHANGE,
@@ -473,13 +481,13 @@ class ExitManager:
                     urgency=0.75,
                 )
 
-        # Exit if trend direction reversed
+        # Exit if trend direction reversed and position underwater
         if regime.trend_direction == "down" and position.side == "long":
-            if profit_pct < 0.02:
+            if profit_pct < -0.01:
                 return ExitSignal(
                     should_exit=True,
                     exit_type=ExitType.REGIME_CHANGE,
-                    reason="Regime trend turned down",
+                    reason=f"Regime trend turned down with {profit_pct:.1%} loss",
                     urgency=0.70,
                 )
 

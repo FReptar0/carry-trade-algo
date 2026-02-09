@@ -24,6 +24,19 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 UTC = ZoneInfo("UTC")
+
+
+def _sanitize_markdown(text: str) -> str:
+    """Escape characters that break Telegram Markdown V1 parsing.
+
+    Replaces problematic chars like _ and ` that Telegram interprets
+    as formatting. Leaves * alone since we use it intentionally.
+    """
+    for ch in ("_", "`", "["):
+        text = text.replace(ch, "\\" + ch)
+    return text
+
+
 logger = logging.getLogger(__name__)
 
 SEVERITY_ORDER = {"INFO": 0, "WARNING": 1, "HIGH": 2, "CRITICAL": 3}
@@ -86,7 +99,8 @@ class AlertManager:
             return False
 
         emoji = SEVERITY_EMOJI.get(severity, "")
-        text = f"{emoji} *{severity}: {title}*\n\n{message}"
+        safe_message = _sanitize_markdown(message)
+        text = f"{emoji} *{severity}: {title}*\n\n{safe_message}"
 
         success = self._send_telegram(text)
         if success:
@@ -124,8 +138,7 @@ class AlertManager:
             True if the API call succeeded.
         """
         url = (
-            f"https://api.telegram.org/bot{self.config.telegram_bot_token}"
-            f"/sendMessage"
+            f"https://api.telegram.org/bot{self.config.telegram_bot_token}/sendMessage"
         )
         payload = {
             "chat_id": self.config.telegram_chat_id,
