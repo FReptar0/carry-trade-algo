@@ -15,6 +15,8 @@ Tick workflow (every hour):
 4. Fetch latest candles from OANDA for each pair
 5. Update correlation monitor
 6. Check economic calendar blackout (skip new entries if active)
+6b. Check ExitManager for existing positions (time, regime, support,
+    trend reversal, profit-scaled trailing — closes if triggered)
 7. Run V3 strategy on candle data
 8. Run signal filter (bandit gate)
 9. Execute signal via OANDA with dynamic sizing
@@ -63,8 +65,10 @@ from src.risk.circuit_breakers import CircuitBreaker, PortfolioState, RiskLimits
 from src.risk.correlation import CorrelationMonitor
 from src.risk.dynamic_sizer import DynamicSizer
 from src.risk.scaling import ScaleManager
+from src.regime.detector import RegimeDetector, RegimeState
 from src.strategy.base import Signal
 from src.strategy.carry_trade_v3 import CarryTradeStrategyV3
+from src.strategy.exit_manager import ExitManager, ExitManagerConfig, PositionState
 from src.utils.logger import TradingLogger
 from src.validation.protocol import (
     ProtocolDay,
@@ -181,6 +185,19 @@ class TradingRunner:
 
         # Cached candle data for correlation updates
         self._candle_cache: dict[str, pd.DataFrame] = {}
+
+        # Phase 3 hardening: ExitManager per pair + regime detector
+        self.regime_detector = RegimeDetector()
+        self._exit_managers: dict[str, ExitManager] = {}
+        self._exit_config = ExitManagerConfig(
+            base_atr_mult=self.strategy.config.atr_stop_mult,
+            time_exit_enabled=True,
+            max_hold_days=30,
+            min_hold_hours=24,
+            profit_scale_enabled=True,
+            regime_exit_enabled=True,
+            use_sr_exits=True,
+        )
 
         # Restore or create protocol
         self.protocol = self._restore_or_create_protocol()
@@ -687,6 +704,17 @@ class TradingRunner:
         # Determine if this pair has an open position
         has_position = pair in self._strategy_positions
 
+        # Phase 3 hardening: Run ExitManager on existing positions
+        # (time-based, regime-change, support-break, profit-scaled trailing)
+        # This runs BEFORE V3 signal check — if ExitManager closes, we're done.
+        if has_position:
+            try:
+                was_closed = self._check_exit_manager(pair, df, now)
+                if was_closed:
+                    return
+            except Exception as e:
+                logger.error("ExitManager error for %s: %s", pair, e)
+
         # Phase D: Check scale-in/scale-out for existing positions
         # Note: scale-out (profit-taking) is allowed in DEGRADED; scale-in is blocked
         if has_position and self.config.enable_scaling:
@@ -826,8 +854,14 @@ class TradingRunner:
             "trade_id": order.trade_id,
             "stop_price": stop_loss_price,
             "high_water_mark": order.avg_fill_price,
+            "low_water_mark": order.avg_fill_price,
         }
         self._trades_opened_today += 1
+
+        # Initialize ExitManager for this pair
+        em = self._get_or_create_exit_manager(pair)
+        regime = self._detect_regime_safe(df)
+        em.initialize_stop(order.avg_fill_price, current_atr, regime)
 
         self.store.save_trade(
             {
@@ -907,6 +941,7 @@ class TradingRunner:
             duration = now - entry_info["entry_time"]
 
         del self._strategy_positions[pair]
+        self._exit_managers.pop(pair, None)  # Clean up ExitManager state
         self._trades_closed_today += 1
 
         # Phase C: Update bandit with trade outcome
@@ -981,6 +1016,135 @@ class TradingRunner:
             pnl,
             reason,
         )
+
+    def _get_or_create_exit_manager(self, pair: str) -> ExitManager:
+        """Get the ExitManager for a pair, creating one if needed.
+
+        Args:
+            pair: Currency pair.
+
+        Returns:
+            ExitManager instance for this pair.
+        """
+        if pair not in self._exit_managers:
+            self._exit_managers[pair] = ExitManager(self._exit_config)
+        return self._exit_managers[pair]
+
+    def _detect_regime_safe(self, df: Optional[pd.DataFrame]) -> Optional[RegimeState]:
+        """Detect regime from candle data, returning None on failure.
+
+        Args:
+            df: Candle DataFrame (needs ~75+ rows for regime detection).
+
+        Returns:
+            RegimeState or None if detection fails.
+        """
+        if df is None or len(df) < 75:
+            return None
+        try:
+            return self.regime_detector.detect(df)
+        except Exception as e:
+            logger.debug("Regime detection failed: %s", e)
+            return None
+
+    def _check_exit_manager(
+        self,
+        pair: str,
+        df: pd.DataFrame,
+        now: datetime,
+    ) -> bool:
+        """Run ExitManager checks on a position and close if triggered.
+
+        Evaluates time-based, regime-change, support-break, trend-reversal,
+        and profit-scaled trailing exits. Returns True if position was closed.
+
+        Args:
+            pair: Currency pair.
+            df: Candle data.
+            now: Current UTC time.
+
+        Returns:
+            True if position was closed, False otherwise.
+        """
+        pos = self._strategy_positions.get(pair)
+        if pos is None:
+            return False
+
+        current_price = float(df["close"].iloc[-1])
+        current_low = float(df["low"].iloc[-1])
+        entry_price = pos.get("entry_price", 0)
+        entry_time = pos.get("entry_time", now)
+
+        if entry_price <= 0:
+            return False
+
+        # Update low-water mark
+        lwm = pos.get("low_water_mark", entry_price)
+        if current_low < lwm:
+            pos["low_water_mark"] = current_low
+            lwm = current_low
+
+        # Update high-water mark (also done in _update_stop_losses,
+        # but keep in sync here for ExitManager's PositionState)
+        hwm = pos.get("high_water_mark", entry_price)
+        if current_price > hwm:
+            pos["high_water_mark"] = current_price
+            hwm = current_price
+
+        # Build PositionState for ExitManager
+        position_state = PositionState(
+            entry_price=entry_price,
+            entry_time=entry_time,
+            current_price=current_price,
+            current_time=now,
+            high_water_mark=hwm,
+            low_water_mark=lwm,
+            side="long",
+        )
+
+        # Get or create ExitManager for this pair
+        em = self._get_or_create_exit_manager(pair)
+
+        # Detect regime (optional — ExitManager handles None gracefully)
+        regime = self._detect_regime_safe(df)
+
+        # Run all exit checks
+        exit_signal = em.check_exit(
+            position=position_state,
+            price_data=df,
+            regime=regime,
+        )
+
+        if exit_signal.should_exit:
+            exit_type_name = (
+                exit_signal.exit_type.value if exit_signal.exit_type else "unknown"
+            )
+            exit_reason = (
+                f"ExitManager [{exit_type_name}]: "
+                f"{exit_signal.reason} (urgency={exit_signal.urgency:.2f})"
+            )
+            logger.info(
+                "ExitManager triggered for %s: %s",
+                pair,
+                exit_reason,
+            )
+
+            # Alert before closing
+            if self.alert_manager:
+                self.alert_manager.send(
+                    "WARNING" if exit_signal.is_urgent else "INFO",
+                    f"Exit Signal: {pair}",
+                    f"{exit_type_name.upper()}: "
+                    f"{exit_signal.reason}\n"
+                    f"Urgency: {exit_signal.urgency:.0%}\n"
+                    f"Profit: {position_state.return_pct:.2%}\n"
+                    f"Held: {position_state.hold_days:.1f} days",
+                )
+
+            self._close_position(pair, exit_reason, now)
+            return True
+
+        return False
 
     def _check_scaling(
         self,
@@ -1113,6 +1277,7 @@ class TradingRunner:
                     "trade_id": None,
                     "stop_price": None,
                     "high_water_mark": pos["avg_price"],
+                    "low_water_mark": pos["avg_price"],
                 }
                 logger.info(
                     "Synced position: %s %d units @ %.5f",
@@ -1158,6 +1323,20 @@ class TradingRunner:
             else:
                 # No broker-side stop — attach one immediately
                 self._attach_initial_stop(pair, trade["trade_id"], pos)
+
+        # Initialize ExitManagers for all synced positions so that
+        # time-based and regime-based checks work from the first tick.
+        for pair, pos in self._strategy_positions.items():
+            em = self._get_or_create_exit_manager(pair)
+            entry_price = pos.get("entry_price", 0)
+            stop_price = pos.get("stop_price")
+            if entry_price > 0 and stop_price and stop_price > 0:
+                # Approximate original ATR from the stop distance
+                atr_est = (
+                    entry_price - stop_price
+                ) / self.strategy.config.atr_stop_mult
+                em.initialize_stop(entry_price, max(atr_est, 0.01))
+            logger.debug("ExitManager initialized for %s", pair)
 
     def _attach_initial_stop(self, pair: str, trade_id: str, pos: dict) -> None:
         """Calculate and attach a 3x ATR stop to an unprotected trade.
