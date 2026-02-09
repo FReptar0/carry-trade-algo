@@ -1733,3 +1733,207 @@ class TestVolatilityScaling:
         # entry_atr should be estimated: (155.0 - 153.5) / 3.0 = 0.5
         if pos["entry_atr"] is not None:
             assert abs(pos["entry_atr"] - 0.5) < 0.01
+
+
+class TestSyncEntryTime:
+    """Tests for _sync_positions using OANDA openTime as entry_time."""
+
+    def test_sync_uses_earliest_open_time_as_entry_time(self, runner):
+        """entry_time should be the earliest openTime across all trades for a pair."""
+        early = datetime(2026, 2, 1, 8, 0, 0, tzinfo=UTC)
+        late = datetime(2026, 2, 5, 14, 30, 0, tzinfo=UTC)
+
+        runner.broker.get_all_positions.return_value = [
+            {
+                "pair": "USD/JPY",
+                "units": 15000,
+                "avg_price": 155.000,
+                "unrealized_pnl": 50.0,
+            }
+        ]
+        # Two trades for same pair (scale-in) — second opened earlier
+        runner.broker.get_open_trades.return_value = [
+            {
+                "trade_id": "T801",
+                "pair": "USD/JPY",
+                "units": 10000,
+                "price": 155.000,
+                "financing": 0.0,
+                "stop_loss_price": 153.500,
+                "unrealized_pnl": 30.0,
+                "open_time": late,
+            },
+            {
+                "trade_id": "T800",
+                "pair": "USD/JPY",
+                "units": 5000,
+                "price": 154.500,
+                "financing": 0.0,
+                "stop_loss_price": 153.500,
+                "unrealized_pnl": 20.0,
+                "open_time": early,
+            },
+        ]
+
+        df = _make_candle_df(50, 155.0)
+        runner._candle_cache["USD/JPY"] = df
+
+        runner._sync_positions()
+
+        pos = runner._strategy_positions.get("USD/JPY")
+        assert pos is not None
+        # entry_time should be the earliest trade's open_time
+        assert pos["entry_time"] == early
+        # Should collect both trade_ids
+        assert "T801" in pos["trade_ids"]
+        assert "T800" in pos["trade_ids"]
+        assert len(pos["trade_ids"]) == 2
+
+    def test_sync_falls_back_to_now_without_open_time(self, runner):
+        """entry_time should remain ~now if no trades have open_time."""
+        before = datetime.now(UTC)
+
+        runner.broker.get_all_positions.return_value = [
+            {
+                "pair": "USD/JPY",
+                "units": 10000,
+                "avg_price": 155.000,
+                "unrealized_pnl": 0.0,
+            }
+        ]
+        runner.broker.get_open_trades.return_value = [
+            {
+                "trade_id": "T900",
+                "pair": "USD/JPY",
+                "units": 10000,
+                "price": 155.000,
+                "financing": 0.0,
+                "stop_loss_price": 153.500,
+                "unrealized_pnl": 0.0,
+                # No open_time field
+            }
+        ]
+
+        df = _make_candle_df(50, 155.0)
+        runner._candle_cache["USD/JPY"] = df
+
+        runner._sync_positions()
+
+        after = datetime.now(UTC)
+        pos = runner._strategy_positions.get("USD/JPY")
+        assert pos is not None
+        # entry_time should be approximately now (the placeholder)
+        assert before <= pos["entry_time"] <= after
+
+    def test_sync_open_time_none_does_not_overwrite(self, runner):
+        """Trades with open_time=None should not overwrite valid entry_time."""
+        real_time = datetime(2026, 2, 1, 8, 0, 0, tzinfo=UTC)
+
+        runner.broker.get_all_positions.return_value = [
+            {
+                "pair": "USD/JPY",
+                "units": 15000,
+                "avg_price": 155.000,
+                "unrealized_pnl": 0.0,
+            }
+        ]
+        runner.broker.get_open_trades.return_value = [
+            {
+                "trade_id": "T950",
+                "pair": "USD/JPY",
+                "units": 10000,
+                "price": 155.000,
+                "financing": 0.0,
+                "stop_loss_price": 153.500,
+                "unrealized_pnl": 0.0,
+                "open_time": real_time,
+            },
+            {
+                "trade_id": "T951",
+                "pair": "USD/JPY",
+                "units": 5000,
+                "price": 155.500,
+                "financing": 0.0,
+                "stop_loss_price": 153.500,
+                "unrealized_pnl": 0.0,
+                "open_time": None,  # Missing open_time
+            },
+        ]
+
+        df = _make_candle_df(50, 155.0)
+        runner._candle_cache["USD/JPY"] = df
+
+        runner._sync_positions()
+
+        pos = runner._strategy_positions.get("USD/JPY")
+        assert pos is not None
+        # Should keep the real_time, not be overwritten by None
+        assert pos["entry_time"] == real_time
+
+    def test_sync_multiple_pairs_independent_entry_times(self, runner):
+        """Each pair should get its own earliest open_time."""
+        runner_config_pairs = runner.config.pairs
+        runner.config = runner.config.__class__(
+            pairs=["USD/JPY", "AUD/JPY"],
+            check_interval_minutes=60,
+            candle_lookback=300,
+            position_size_units=10000,
+            initial_equity=100000.0,
+            log_dir=runner.config.log_dir,
+            db_path=runner.config.db_path,
+            events_file=runner.config.events_file,
+        )
+
+        usdjpy_time = datetime(2026, 2, 1, 10, 0, 0, tzinfo=UTC)
+        audjpy_time = datetime(2026, 2, 3, 16, 0, 0, tzinfo=UTC)
+
+        runner.broker.get_all_positions.return_value = [
+            {
+                "pair": "USD/JPY",
+                "units": 10000,
+                "avg_price": 155.000,
+                "unrealized_pnl": 0.0,
+            },
+            {
+                "pair": "AUD/JPY",
+                "units": 5000,
+                "avg_price": 98.000,
+                "unrealized_pnl": 0.0,
+            },
+        ]
+        runner.broker.get_open_trades.return_value = [
+            {
+                "trade_id": "T1000",
+                "pair": "USD/JPY",
+                "units": 10000,
+                "price": 155.000,
+                "financing": 0.0,
+                "stop_loss_price": 153.500,
+                "unrealized_pnl": 0.0,
+                "open_time": usdjpy_time,
+            },
+            {
+                "trade_id": "T1001",
+                "pair": "AUD/JPY",
+                "units": 5000,
+                "price": 98.000,
+                "financing": 0.0,
+                "stop_loss_price": 96.500,
+                "unrealized_pnl": 0.0,
+                "open_time": audjpy_time,
+            },
+        ]
+
+        df_usd = _make_candle_df(50, 155.0)
+        df_aud = _make_candle_df(50, 98.0)
+        runner._candle_cache["USD/JPY"] = df_usd
+        runner._candle_cache["AUD/JPY"] = df_aud
+
+        runner._sync_positions()
+
+        pos_usd = runner._strategy_positions.get("USD/JPY")
+        pos_aud = runner._strategy_positions.get("AUD/JPY")
+        assert pos_usd is not None
+        assert pos_aud is not None
+        assert pos_usd["entry_time"] == usdjpy_time
+        assert pos_aud["entry_time"] == audjpy_time

@@ -455,3 +455,132 @@ class TestCancelOrder:
 
         result = mock_broker.cancel_order("30001")
         assert result is False
+
+
+class TestGetOpenTrades:
+    """Tests for open trade queries and openTime parsing."""
+
+    def test_open_time_extracted(self, mock_broker):
+        """Should parse OANDA openTime into a datetime."""
+        mock_broker.client.request.return_value = {
+            "trades": [
+                {
+                    "id": "12345",
+                    "instrument": "USD_JPY",
+                    "currentUnits": "10000",
+                    "price": "155.000",
+                    "unrealizedPL": "50.00",
+                    "financing": "-1.25",
+                    "openTime": "2026-02-03T14:23:17.000000000Z",
+                    "stopLossOrder": {
+                        "price": "153.500",
+                    },
+                }
+            ]
+        }
+
+        trades = mock_broker.get_open_trades()
+        assert trades is not None
+        assert len(trades) == 1
+
+        trade = trades[0]
+        assert trade["trade_id"] == "12345"
+        assert trade["pair"] == "USD/JPY"
+        assert trade["units"] == 10000
+        assert trade["price"] == 155.0
+        assert trade["stop_loss_price"] == 153.5
+        assert trade["open_time"] is not None
+
+        from datetime import datetime, timezone
+
+        expected = datetime(2026, 2, 3, 14, 23, 17, tzinfo=timezone.utc)
+        assert trade["open_time"].year == expected.year
+        assert trade["open_time"].month == expected.month
+        assert trade["open_time"].day == expected.day
+        assert trade["open_time"].hour == expected.hour
+        assert trade["open_time"].minute == expected.minute
+        assert trade["open_time"].second == expected.second
+
+    def test_open_time_missing_graceful(self, mock_broker):
+        """Should return open_time=None when openTime is absent."""
+        mock_broker.client.request.return_value = {
+            "trades": [
+                {
+                    "id": "12346",
+                    "instrument": "AUD_JPY",
+                    "currentUnits": "5000",
+                    "price": "98.000",
+                    "unrealizedPL": "10.00",
+                    "financing": "0.00",
+                    # No openTime field
+                }
+            ]
+        }
+
+        trades = mock_broker.get_open_trades()
+        assert trades is not None
+        assert len(trades) == 1
+        assert trades[0]["open_time"] is None
+        assert trades[0]["stop_loss_price"] is None
+
+    def test_open_time_malformed(self, mock_broker):
+        """Should return open_time=None for unparseable openTime string."""
+        mock_broker.client.request.return_value = {
+            "trades": [
+                {
+                    "id": "12347",
+                    "instrument": "GBP_JPY",
+                    "currentUnits": "1000",
+                    "price": "212.000",
+                    "unrealizedPL": "0.00",
+                    "financing": "0.00",
+                    "openTime": "not-a-timestamp",
+                }
+            ]
+        }
+
+        trades = mock_broker.get_open_trades()
+        assert trades is not None
+        assert len(trades) == 1
+        assert trades[0]["open_time"] is None
+
+    def test_multiple_trades_returned(self, mock_broker):
+        """Should return all trades with their respective openTimes."""
+        mock_broker.client.request.return_value = {
+            "trades": [
+                {
+                    "id": "100",
+                    "instrument": "AUD_JPY",
+                    "currentUnits": "5000",
+                    "price": "98.000",
+                    "unrealizedPL": "10.00",
+                    "financing": "-0.50",
+                    "openTime": "2026-02-01T08:00:00.000000000Z",
+                },
+                {
+                    "id": "101",
+                    "instrument": "AUD_JPY",
+                    "currentUnits": "3000",
+                    "price": "98.500",
+                    "unrealizedPL": "5.00",
+                    "financing": "-0.30",
+                    "openTime": "2026-02-03T10:15:00.000000000Z",
+                },
+            ]
+        }
+
+        trades = mock_broker.get_open_trades()
+        assert trades is not None
+        assert len(trades) == 2
+        assert trades[0]["open_time"] is not None
+        assert trades[1]["open_time"] is not None
+        # First trade should be earlier
+        assert trades[0]["open_time"] < trades[1]["open_time"]
+
+    def test_empty_trades(self, mock_broker):
+        """Should return empty list when no trades."""
+        mock_broker.client.request.return_value = {"trades": []}
+
+        trades = mock_broker.get_open_trades()
+        assert trades is not None
+        assert len(trades) == 0

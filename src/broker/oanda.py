@@ -542,8 +542,9 @@ class OandaBroker:
 
         Returns:
             List of trade dicts with keys: trade_id, pair, units,
-            price (open price), unrealized_pnl, stop_loss_price
-            (or None if no stop). Returns None on failure.
+            price (open price), unrealized_pnl, financing,
+            stop_loss_price (or None if no stop), open_time
+            (datetime or None). Returns None on failure.
         """
         endpoint = trades_api.OpenTrades(accountID=self.account_id)
         response = self.client.request(endpoint)
@@ -556,6 +557,18 @@ class OandaBroker:
             if sl_order:
                 sl_price = float(sl_order["price"])
 
+            # Parse openTime from OANDA (RFC 3339 nano format)
+            open_time = None
+            raw_time = t.get("openTime")
+            if raw_time:
+                try:
+                    # OANDA format: "2026-02-03T14:23:17.000000000Z"
+                    # Truncate nanoseconds to microseconds for strptime
+                    clean = raw_time.replace("Z", "+00:00")
+                    open_time = datetime.fromisoformat(clean)
+                except (ValueError, TypeError):
+                    logger.debug("Could not parse openTime: %s", raw_time)
+
             result.append(
                 {
                     "trade_id": str(t["id"]),
@@ -565,6 +578,7 @@ class OandaBroker:
                     "unrealized_pnl": float(t.get("unrealizedPL", "0")),
                     "financing": float(t.get("financing", "0")),
                     "stop_loss_price": sl_price,
+                    "open_time": open_time,
                 }
             )
 

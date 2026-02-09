@@ -1946,11 +1946,14 @@ class TradingRunner:
             if pair in [p for p in self.config.pairs]:
                 self._strategy_positions[pair] = {
                     "entry_price": pos["avg_price"],
-                    "entry_time": datetime.now(UTC),
+                    "entry_time": datetime.now(
+                        UTC
+                    ),  # Placeholder; overwritten below if OANDA openTime available
                     "units": pos["units"],
                     "tranche_count": 1,
                     "levels_taken": 0,
                     "trade_id": None,
+                    "trade_ids": [],
                     "stop_price": None,
                     "high_water_mark": pos["avg_price"],
                     "low_water_mark": pos["avg_price"],
@@ -1980,9 +1983,21 @@ class TradingRunner:
             if pos is None:
                 continue
 
+            # Collect all trade_ids for this position
+            tid = trade["trade_id"]
+            if tid not in pos.get("trade_ids", []):
+                pos.setdefault("trade_ids", []).append(tid)
+
             # Store the trade_id (first trade for this pair wins)
             if pos.get("trade_id") is None:
-                pos["trade_id"] = trade["trade_id"]
+                pos["trade_id"] = tid
+
+            # Use earliest OANDA openTime as the real entry_time
+            trade_open_time = trade.get("open_time")
+            if trade_open_time is not None:
+                current_entry = pos.get("entry_time")
+                if current_entry is None or trade_open_time < current_entry:
+                    pos["entry_time"] = trade_open_time
 
             # Update HWM: use current price if above entry
             current_price = trade["price"] + (
@@ -2003,6 +2018,15 @@ class TradingRunner:
             else:
                 # No broker-side stop — attach one immediately
                 self._attach_initial_stop(pair, trade["trade_id"], pos)
+
+        # Log real entry_times recovered from OANDA
+        for pair, pos in self._strategy_positions.items():
+            logger.info(
+                "Position %s entry_time set from OANDA: %s (trades: %d)",
+                pair,
+                pos.get("entry_time"),
+                len(pos.get("trade_ids", [])),
+            )
 
         # Initialize ExitManagers for all synced positions so that
         # time-based and regime-based checks work from the first tick.
