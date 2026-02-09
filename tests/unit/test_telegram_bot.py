@@ -431,6 +431,72 @@ class TestFinancingDisplay:
         assert "Carry $" not in result
 
 
+class TestVolatilityScalingDisplay:
+    """Tests for volatility scaling display in bot commands."""
+
+    def test_positions_shows_vol_ratio(self, bot):
+        """Positions should show Vol X.Xx when vol_ratio is present."""
+        state = _sample_state()
+        state["positions"][0]["vol_ratio"] = 1.2
+        state["positions"][0]["original_units"] = 5000
+        result = bot._handle_positions(state)
+        assert "Vol 1.2x" in result
+
+    def test_positions_shows_warning_above_threshold(self, bot):
+        """Positions should show warning emoji when vol_ratio > 1.5."""
+        state = _sample_state()
+        state["positions"][0]["vol_ratio"] = 1.8
+        state["positions"][0]["original_units"] = 5000
+        result = bot._handle_positions(state)
+        assert "\u26a0\ufe0f Vol 1.8x" in result
+
+    def test_positions_shows_original_units_after_trim(self, bot):
+        """Positions should show Orig units when different from current units."""
+        state = _sample_state()
+        state["positions"][0]["vol_ratio"] = 1.6
+        state["positions"][0]["units"] = 3000
+        state["positions"][0]["original_units"] = 5000
+        result = bot._handle_positions(state)
+        assert "Orig 5,000u" in result
+
+    def test_positions_hides_original_units_when_untrimmed(self, bot):
+        """Positions should not show Orig units when same as current."""
+        state = _sample_state()
+        state["positions"][0]["vol_ratio"] = 1.2
+        state["positions"][0]["original_units"] = 5000
+        result = bot._handle_positions(state)
+        assert "Orig" not in result
+
+    def test_status_shows_vol_warning_suffix(self, bot):
+        """Status should show vol warning suffix on position line when > 1.5."""
+        state = _sample_state()
+        state["positions"][0]["vol_ratio"] = 2.0
+        result = bot._handle_status(state)
+        assert "\u26a0\ufe0f2.0x" in result
+
+    def test_status_no_vol_warning_below_threshold(self, bot):
+        """Status should not show vol warning when vol_ratio <= 1.5."""
+        state = _sample_state()
+        state["positions"][0]["vol_ratio"] = 1.3
+        result = bot._handle_status(state)
+        assert "\u26a0\ufe0f" not in result
+
+    def test_positions_handles_missing_vol_ratio(self, bot):
+        """Positions should not crash when vol_ratio is absent."""
+        state = _sample_state()
+        # Default _sample_state has no vol_ratio — should work fine
+        result = bot._handle_positions(state)
+        assert "Vol" not in result
+        assert "USD/JPY" in result
+
+    def test_status_handles_missing_vol_ratio(self, bot):
+        """Status should not crash when vol_ratio is absent."""
+        state = _sample_state()
+        result = bot._handle_status(state)
+        assert "\u26a0\ufe0f" not in result
+        assert "USD/JPY" in result
+
+
 class TestPendingOrdersDisplay:
     """Tests for pending orders display in bot commands."""
 

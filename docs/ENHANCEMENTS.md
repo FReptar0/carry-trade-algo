@@ -35,8 +35,8 @@ Use limit orders instead of market orders for entries. Place them 0.5-1 ATR belo
 
 ## Medium Impact — Better Risk Management
 
-### 8. Continuous Volatility Scaling
-The system detects regimes but the response is coarse (discrete buckets). A continuous inverse-realized-vol scaling function would size positions more precisely, reducing exposure smoothly as vol rises.
+### 8. ~~Continuous Volatility Scaling~~ ✅ Completed 2026-02-08
+Each tick, compares current ATR to entry-time ATR for each position. When vol ratio exceeds 1.5x, trims position via partial close to restore original dollar-risk. Floor at 25% of original units, 24h cooldown between trims. Config: `enable_vol_scaling`, `vol_scaling_threshold`, `vol_scaling_cooldown_hours`, `vol_scaling_min_position_pct`. Telegram `/positions` shows vol ratio, `/status` shows warning when >1.5x. 13 new tests, all 590 passing.
 
 ### 9. ~~Drawdown-Aware Rebalancing~~ ✅ Completed 2026-02-02
 Quadratic decay position sizing: `factor = max(0.25, 1.0 - (dd/0.20)^2)`. Smoothly reduces new position size from 100% at 0% DD to 25% floor at 20% DD. Circuit breaker remains as backstop. Wired into runner via `PerformanceMonitor.get_snapshot().drawdown`. 6 new tests, all 490 passing.

@@ -29,6 +29,7 @@ Tick workflow (every hour):
 12c. Check recovery conditions (DEGRADED → RUNNING)
 13. Check protocol abort conditions (from RUNNING or DEGRADED)
 13b. Update broker-side stop-losses (trailing / ratchet)
+13c. Continuous volatility scaling (trim oversized positions)
 14. Save state to SQLite
 15. Watchdog heartbeat
 16. Log tick summary
@@ -124,6 +125,10 @@ class RunnerConfig:
     enable_dynamic_sizing: bool = True
     enable_scaling: bool = True
     max_pending_ticks: int = 2  # Cancel unfilled limit orders after N ticks (~2 hours)
+    enable_vol_scaling: bool = True  # Trim positions when ATR rises above entry ATR
+    vol_scaling_threshold: float = 1.5  # Trim when current_atr / entry_atr > this
+    vol_scaling_cooldown_hours: int = 24  # Min hours between vol trims per pair
+    vol_scaling_min_position_pct: float = 0.25  # Never trim below 25% of original units
 
 
 class TradingRunner:
@@ -285,6 +290,23 @@ class TradingRunner:
             internal = self._strategy_positions.get(pair, {})
             pos_financing = internal.get("financing", bp.get("financing", 0.0))
             total_financing += pos_financing
+
+            # Compute vol ratio if possible (entry_atr + cached candles)
+            entry_atr = internal.get("entry_atr")
+            vol_ratio: float | None = None
+            if entry_atr and entry_atr > 0:
+                df = self._candle_cache.get(pair)
+                if df is not None and len(df) >= 20:
+                    try:
+                        from src.strategy.indicators import atr as calc_atr
+
+                        atr_vals = calc_atr(df["high"], df["low"], df["close"])
+                        cur_atr = float(atr_vals.iloc[-1])
+                        if cur_atr > 0:
+                            vol_ratio = cur_atr / entry_atr
+                    except Exception:
+                        pass
+
             positions.append(
                 {
                     "pair": pair,
@@ -298,6 +320,9 @@ class TradingRunner:
                     "entry_time": internal.get("entry_time"),
                     "tranche_count": internal.get("tranche_count", 1),
                     "financing": pos_financing,
+                    "entry_atr": entry_atr,
+                    "original_units": internal.get("original_units"),
+                    "vol_ratio": vol_ratio,
                 }
             )
 
@@ -736,6 +761,12 @@ class TradingRunner:
         except Exception as e:
             logger.error("Stop-loss update sweep failed: %s", e)
 
+        # 11c. Continuous volatility scaling (trim oversized positions)
+        try:
+            self._check_volatility_scaling(now)
+        except Exception as e:
+            logger.error("Volatility scaling sweep failed: %s", e)
+
         # 12. Save equity snapshot
         total_financing = sum(
             pos.get("financing", 0.0) for pos in self._strategy_positions.values()
@@ -1124,6 +1155,9 @@ class TradingRunner:
             "high_water_mark": fill_price,
             "low_water_mark": fill_price,
             "financing": 0.0,
+            "entry_atr": current_atr,
+            "original_units": units,
+            "last_vol_trim_time": None,
         }
         self._trades_opened_today += 1
 
@@ -1921,6 +1955,9 @@ class TradingRunner:
                     "high_water_mark": pos["avg_price"],
                     "low_water_mark": pos["avg_price"],
                     "financing": pos.get("financing", 0.0),
+                    "entry_atr": None,  # Unknown at sync; estimated later
+                    "original_units": pos["units"],
+                    "last_vol_trim_time": None,
                 }
                 logger.info(
                     "Synced position: %s %d units @ %.5f",
@@ -1978,7 +2015,11 @@ class TradingRunner:
                 atr_est = (
                     entry_price - stop_price
                 ) / self.strategy.config.atr_stop_mult
-                em.initialize_stop(entry_price, max(atr_est, 0.01))
+                atr_est = max(atr_est, 0.01)
+                em.initialize_stop(entry_price, atr_est)
+                # Estimate entry_atr for vol scaling if not already set
+                if pos.get("entry_atr") is None:
+                    pos["entry_atr"] = atr_est
             logger.debug("ExitManager initialized for %s", pair)
 
     def _attach_initial_stop(self, pair: str, trade_id: str, pos: dict) -> None:
@@ -2133,6 +2174,122 @@ class TradingRunner:
 
             except Exception as e:
                 logger.error("Error updating stop for %s: %s", pair, e)
+
+    def _check_volatility_scaling(self, now: datetime) -> None:
+        """Trim positions where realized volatility has risen above entry level.
+
+        For each open position with a known entry_atr, compares current ATR
+        to entry ATR. If the ratio exceeds `vol_scaling_threshold` (default
+        1.5×), trims the position proportionally via partial close so that
+        the dollar-risk returns to approximately the intended level.
+
+        Guards:
+        - Cooldown: minimum `vol_scaling_cooldown_hours` between trims per pair.
+        - Floor: never trims below `vol_scaling_min_position_pct` of original units.
+        - Minimum trim: at least 1 unit to avoid no-op OANDA calls.
+
+        Args:
+            now: Current UTC time.
+        """
+        if not self.config.enable_vol_scaling:
+            return
+
+        from src.strategy.indicators import atr as calc_atr
+
+        threshold = self.config.vol_scaling_threshold
+        cooldown = timedelta(hours=self.config.vol_scaling_cooldown_hours)
+        min_pct = self.config.vol_scaling_min_position_pct
+
+        for pair, pos in list(self._strategy_positions.items()):
+            try:
+                entry_atr = pos.get("entry_atr")
+                if entry_atr is None or entry_atr <= 0:
+                    continue
+
+                # Get current candle data from cache
+                df = self._candle_cache.get(pair)
+                if df is None or len(df) < 20:
+                    continue
+
+                atr_vals = calc_atr(df["high"], df["low"], df["close"])
+                current_atr = float(atr_vals.iloc[-1])
+                if np.isnan(current_atr) or current_atr <= 0:
+                    continue
+
+                vol_ratio = current_atr / entry_atr
+                if vol_ratio <= threshold:
+                    continue
+
+                # Cooldown check
+                last_trim = pos.get("last_vol_trim_time")
+                if last_trim is not None and (now - last_trim) < cooldown:
+                    continue
+
+                # Calculate trim amount
+                current_units = pos["units"]
+                original_units = pos.get("original_units", current_units)
+                min_units = max(1, int(original_units * min_pct))
+
+                # Target units = current_units scaled down by vol_ratio
+                # This restores the original dollar-risk:
+                #   entry_risk = entry_units × entry_atr
+                #   current_risk = current_units × current_atr
+                #   target: target_units × current_atr = original_units × entry_atr
+                #   target_units = original_units × entry_atr / current_atr
+                target_units = max(
+                    min_units,
+                    int(original_units * entry_atr / current_atr),
+                )
+
+                if target_units >= current_units:
+                    continue  # Nothing to trim
+
+                trim_units = current_units - target_units
+
+                # Safety: never trim to zero
+                if trim_units <= 0 or trim_units >= current_units:
+                    continue
+
+                # Execute partial close
+                order = self.broker.close_position(pair, units=trim_units)
+                if order is None or order.avg_fill_price is None:
+                    logger.warning(
+                        "Vol scaling partial close failed for %s",
+                        pair,
+                    )
+                    continue
+
+                # Update position state
+                pos["units"] = current_units - trim_units
+                pos["last_vol_trim_time"] = now
+
+                partial_pnl = (order.avg_fill_price - pos["entry_price"]) * trim_units
+
+                logger.info(
+                    "Vol scaled %s: trimmed %d→%d units "
+                    "(vol_ratio=%.2f, entry_atr=%.4f, current_atr=%.4f, "
+                    "PnL=$%.2f)",
+                    pair,
+                    current_units,
+                    pos["units"],
+                    vol_ratio,
+                    entry_atr,
+                    current_atr,
+                    partial_pnl,
+                )
+
+                if self.alert_manager:
+                    self.alert_manager.send(
+                        "WARNING",
+                        "Vol Scaling Trim",
+                        f"{pair}: trimmed {current_units}→{pos['units']} units\n"
+                        f"Vol ratio: {vol_ratio:.2f}x "
+                        f"(ATR {entry_atr:.4f}→{current_atr:.4f})\n"
+                        f"Partial PnL: ${partial_pnl:+,.2f}",
+                    )
+
+            except Exception as e:
+                logger.error("Vol scaling error for %s: %s", pair, e)
 
     def _check_new_day(self, now: datetime) -> None:
         """Handle day transitions."""

@@ -247,8 +247,14 @@ class TelegramCommandBot:
             )
             dot = "\U0001f7e2" if pnl >= 0 else "\U0001f534"
             stop_str = f"SL {stop:.3f}" if stop else "no SL"
+            vol_ratio = pos.get("vol_ratio")
+            vol_warn = (
+                f" \u26a0\ufe0f{vol_ratio:.1f}x"
+                if vol_ratio and vol_ratio > 1.5
+                else ""
+            )
             lines.append(
-                f"{dot} {pair} {units:,}u ${pnl:+,.2f} ({profit_pct:+.1f}%) {stop_str}"
+                f"{dot} {pair} {units:,}u ${pnl:+,.2f} ({profit_pct:+.1f}%) {stop_str}{vol_warn}"
             )
 
         # Pending orders (if any)
@@ -405,6 +411,18 @@ class TelegramCommandBot:
                 lines.append(f"SL {stop:.3f} (risk {risk_pct:.1f}%)")
             else:
                 lines.append("SL none")
+
+            # Volatility ratio indicator
+            vol_ratio = pos.get("vol_ratio")
+            original_units = pos.get("original_units")
+            if vol_ratio is not None:
+                if vol_ratio > 1.5:
+                    vol_str = f"\u26a0\ufe0f Vol {vol_ratio:.1f}x"
+                else:
+                    vol_str = f"Vol {vol_ratio:.1f}x"
+                if original_units and original_units != units:
+                    vol_str += f" | Orig {original_units:,}u"
+                lines.append(vol_str)
 
         # Pending orders
         if pending:

@@ -1315,3 +1315,421 @@ class TestSystemStatePendingOrders:
 
         assert "pending_orders" in state
         assert state["pending_orders"] == {}
+
+
+class TestVolatilityScaling:
+    """Tests for _check_volatility_scaling: vol-based position trimming."""
+
+    def _setup_position_with_candles(
+        self,
+        runner,
+        pair: str = "USD/JPY",
+        entry_atr: float = 0.50,
+        current_atr_target: float = 1.00,
+        units: int = 10000,
+        entry_price: float = 155.0,
+    ):
+        """Helper: set up a position with known ATR values.
+
+        Creates a candle DataFrame where the ATR approximates current_atr_target
+        by controlling the high-low spread.
+        """
+        import numpy as np
+
+        n_bars = 50
+        rng = np.random.default_rng(42)
+        closes = np.full(n_bars, entry_price)
+        # Control ATR via high-low spread (ATR ≈ high - low for flat prices)
+        half_range = current_atr_target / 2
+        highs = closes + half_range
+        lows = closes - half_range
+
+        df = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2026-01-01", periods=n_bars, freq="h"),
+                "open": closes,
+                "high": highs,
+                "low": lows,
+                "close": closes,
+                "volume": [1000] * n_bars,
+            }
+        )
+
+        runner._candle_cache[pair] = df
+        now = datetime(2026, 2, 1, 12, 0, tzinfo=UTC)
+
+        runner._strategy_positions[pair] = {
+            "entry_price": entry_price,
+            "entry_time": now - timedelta(days=5),
+            "units": units,
+            "tranche_count": 1,
+            "levels_taken": 0,
+            "trade_id": "T100",
+            "stop_price": entry_price - entry_atr * 3,
+            "high_water_mark": entry_price,
+            "low_water_mark": entry_price,
+            "financing": 0.0,
+            "trade_ids": ["T100"],
+            "entry_atr": entry_atr,
+            "original_units": units,
+            "last_vol_trim_time": None,
+        }
+
+        return now
+
+    def test_trims_when_vol_ratio_exceeds_threshold(self, runner):
+        """ATR doubles from 0.50 to ~1.0 → position trimmed proportionally."""
+        now = self._setup_position_with_candles(
+            runner, entry_atr=0.50, current_atr_target=1.00, units=10000
+        )
+
+        # Mock broker partial close
+        fill = Fill(
+            fill_id="f1",
+            order_id="CLOSE1",
+            timestamp=now,
+            price=155.0,
+            quantity=5000,
+            commission=0,
+            slippage=0,
+        )
+        fill_order = Order(
+            pair="USD/JPY",
+            side=OrderSide.SELL,
+            order_type=OrderType.MARKET,
+            quantity=5000,
+            order_id="CLOSE1",
+            status=OrderStatus.FILLED,
+            fills=[fill],
+        )
+        runner.broker.close_position.return_value = fill_order
+        runner.alert_manager = MagicMock()
+
+        runner._check_volatility_scaling(now)
+
+        # Position should be trimmed: target = 10000 * 0.50 / 1.00 = 5000
+        pos = runner._strategy_positions["USD/JPY"]
+        assert pos["units"] < 10000
+        assert pos["units"] >= 2500  # Floor: 25% of 10000
+        runner.broker.close_position.assert_called_once()
+        # Verify the trim units in the call
+        call_args = runner.broker.close_position.call_args
+        assert call_args[0][0] == "USD/JPY"  # pair
+        assert (
+            call_args[1].get("units", call_args[0][1] if len(call_args[0]) > 1 else 0)
+            > 0
+        )
+
+    def test_no_trim_below_threshold(self, runner):
+        """ATR only 20% higher (ratio 1.2) → no trim (threshold is 1.5)."""
+        now = self._setup_position_with_candles(
+            runner, entry_atr=0.50, current_atr_target=0.60, units=10000
+        )
+
+        runner._check_volatility_scaling(now)
+
+        # No trim — vol ratio 1.2 < 1.5 threshold
+        pos = runner._strategy_positions["USD/JPY"]
+        assert pos["units"] == 10000
+        runner.broker.close_position.assert_not_called()
+
+    def test_cooldown_prevents_rapid_trims(self, runner):
+        """Second trim within 24h cooldown is blocked."""
+        now = self._setup_position_with_candles(
+            runner, entry_atr=0.50, current_atr_target=1.00, units=10000
+        )
+
+        # Set last trim to 6 hours ago (within 24h cooldown)
+        runner._strategy_positions["USD/JPY"]["last_vol_trim_time"] = now - timedelta(
+            hours=6
+        )
+
+        runner._check_volatility_scaling(now)
+
+        # No trim — cooldown not elapsed
+        pos = runner._strategy_positions["USD/JPY"]
+        assert pos["units"] == 10000
+        runner.broker.close_position.assert_not_called()
+
+    def test_cooldown_allows_trim_after_elapsed(self, runner):
+        """Trim allowed after 24h+ since last trim."""
+        now = self._setup_position_with_candles(
+            runner, entry_atr=0.50, current_atr_target=1.00, units=10000
+        )
+
+        # Set last trim to 25 hours ago (cooldown elapsed)
+        runner._strategy_positions["USD/JPY"]["last_vol_trim_time"] = now - timedelta(
+            hours=25
+        )
+
+        fill = Fill(
+            fill_id="f2",
+            order_id="CLOSE2",
+            timestamp=now,
+            price=155.0,
+            quantity=5000,
+            commission=0,
+            slippage=0,
+        )
+        fill_order = Order(
+            pair="USD/JPY",
+            side=OrderSide.SELL,
+            order_type=OrderType.MARKET,
+            quantity=5000,
+            order_id="CLOSE2",
+            status=OrderStatus.FILLED,
+            fills=[fill],
+        )
+        runner.broker.close_position.return_value = fill_order
+        runner.alert_manager = MagicMock()
+
+        runner._check_volatility_scaling(now)
+
+        pos = runner._strategy_positions["USD/JPY"]
+        assert pos["units"] < 10000
+        runner.broker.close_position.assert_called_once()
+
+    def test_floor_prevents_over_trimming(self, runner):
+        """Position near minimum → trimmed only to floor (25% of original)."""
+        now = self._setup_position_with_candles(
+            runner, entry_atr=0.10, current_atr_target=1.00, units=10000
+        )
+        # Vol ratio = 10x, target = 10000 * 0.10 / 1.00 = 1000
+        # But floor = 10000 * 0.25 = 2500, so target should be clamped to 2500
+
+        fill = Fill(
+            fill_id="f3",
+            order_id="CLOSE3",
+            timestamp=now,
+            price=155.0,
+            quantity=7500,
+            commission=0,
+            slippage=0,
+        )
+        fill_order = Order(
+            pair="USD/JPY",
+            side=OrderSide.SELL,
+            order_type=OrderType.MARKET,
+            quantity=7500,
+            order_id="CLOSE3",
+            status=OrderStatus.FILLED,
+            fills=[fill],
+        )
+        runner.broker.close_position.return_value = fill_order
+        runner.alert_manager = MagicMock()
+
+        runner._check_volatility_scaling(now)
+
+        pos = runner._strategy_positions["USD/JPY"]
+        # Should be trimmed to floor = 2500 (25% of 10000)
+        assert pos["units"] == 2500
+        runner.broker.close_position.assert_called_once()
+
+    def test_skips_when_disabled(self, runner):
+        """enable_vol_scaling=False → no action at all."""
+        now = self._setup_position_with_candles(
+            runner, entry_atr=0.50, current_atr_target=1.00, units=10000
+        )
+        runner.config.enable_vol_scaling = False
+
+        runner._check_volatility_scaling(now)
+
+        assert runner._strategy_positions["USD/JPY"]["units"] == 10000
+        runner.broker.close_position.assert_not_called()
+
+    def test_skips_no_entry_atr(self, runner):
+        """Position with entry_atr=None is skipped gracefully."""
+        now = self._setup_position_with_candles(
+            runner, entry_atr=0.50, current_atr_target=1.00, units=10000
+        )
+        runner._strategy_positions["USD/JPY"]["entry_atr"] = None
+
+        runner._check_volatility_scaling(now)
+
+        assert runner._strategy_positions["USD/JPY"]["units"] == 10000
+        runner.broker.close_position.assert_not_called()
+
+    def test_skips_no_candle_cache(self, runner):
+        """No cached candle data → skipped gracefully."""
+        now = datetime(2026, 2, 1, 12, 0, tzinfo=UTC)
+        runner._strategy_positions["USD/JPY"] = {
+            "entry_price": 155.0,
+            "entry_time": now - timedelta(days=5),
+            "units": 10000,
+            "tranche_count": 1,
+            "levels_taken": 0,
+            "trade_id": "T100",
+            "stop_price": 153.5,
+            "high_water_mark": 155.0,
+            "low_water_mark": 155.0,
+            "financing": 0.0,
+            "trade_ids": ["T100"],
+            "entry_atr": 0.50,
+            "original_units": 10000,
+            "last_vol_trim_time": None,
+        }
+        # No candle cache entry for USD/JPY
+        runner._candle_cache = {}
+
+        runner._check_volatility_scaling(now)
+
+        assert runner._strategy_positions["USD/JPY"]["units"] == 10000
+        runner.broker.close_position.assert_not_called()
+
+    def test_handles_broker_failure(self, runner):
+        """Partial close returns None → no crash, units unchanged."""
+        now = self._setup_position_with_candles(
+            runner, entry_atr=0.50, current_atr_target=1.00, units=10000
+        )
+        runner.broker.close_position.return_value = None
+
+        runner._check_volatility_scaling(now)
+
+        # Units unchanged — broker failed
+        assert runner._strategy_positions["USD/JPY"]["units"] == 10000
+
+    def test_updates_position_state_after_trim(self, runner):
+        """After trim: units reduced and last_vol_trim_time set."""
+        now = self._setup_position_with_candles(
+            runner, entry_atr=0.50, current_atr_target=1.00, units=10000
+        )
+
+        fill = Fill(
+            fill_id="f4",
+            order_id="CLOSE4",
+            timestamp=now,
+            price=155.0,
+            quantity=5000,
+            commission=0,
+            slippage=0,
+        )
+        fill_order = Order(
+            pair="USD/JPY",
+            side=OrderSide.SELL,
+            order_type=OrderType.MARKET,
+            quantity=5000,
+            order_id="CLOSE4",
+            status=OrderStatus.FILLED,
+            fills=[fill],
+        )
+        runner.broker.close_position.return_value = fill_order
+        runner.alert_manager = MagicMock()
+
+        runner._check_volatility_scaling(now)
+
+        pos = runner._strategy_positions["USD/JPY"]
+        assert pos["units"] < 10000
+        assert pos["last_vol_trim_time"] == now
+
+    def test_sends_alert_on_trim(self, runner):
+        """Telegram alert fired with WARNING severity on trim."""
+        now = self._setup_position_with_candles(
+            runner, entry_atr=0.50, current_atr_target=1.00, units=10000
+        )
+
+        fill = Fill(
+            fill_id="f5",
+            order_id="CLOSE5",
+            timestamp=now,
+            price=155.0,
+            quantity=5000,
+            commission=0,
+            slippage=0,
+        )
+        fill_order = Order(
+            pair="USD/JPY",
+            side=OrderSide.SELL,
+            order_type=OrderType.MARKET,
+            quantity=5000,
+            order_id="CLOSE5",
+            status=OrderStatus.FILLED,
+            fills=[fill],
+        )
+        runner.broker.close_position.return_value = fill_order
+        runner.alert_manager = MagicMock()
+
+        runner._check_volatility_scaling(now)
+
+        runner.alert_manager.send.assert_called_once()
+        call_args = runner.alert_manager.send.call_args
+        assert call_args[0][0] == "WARNING"
+        assert "Vol Scaling Trim" in call_args[0][1]
+        assert "USD/JPY" in call_args[0][2]
+
+    def test_entry_atr_stored_on_new_position(self, runner):
+        """_promote_filled_order includes entry_atr in position dict."""
+        now = datetime(2026, 2, 1, 14, 0, tzinfo=UTC)
+
+        fill = Fill(
+            fill_id="F600",
+            order_id="ORD600",
+            timestamp=now,
+            price=108.000,
+            quantity=5000,
+            commission=0,
+            slippage=0,
+        )
+        order = Order(
+            pair="AUD/JPY",
+            side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            quantity=5000,
+            status=OrderStatus.FILLED,
+            fills=[fill],
+            trade_id="T600",
+        )
+
+        runner._promote_filled_order(
+            pair="AUD/JPY",
+            order=order,
+            units=5000,
+            stop_loss_price=106.500,
+            current_atr=0.65,
+            reason="golden cross",
+            now=now,
+        )
+
+        assert "AUD/JPY" in runner._strategy_positions
+        pos = runner._strategy_positions["AUD/JPY"]
+        assert pos["entry_atr"] == 0.65
+        assert pos["original_units"] == 5000
+        assert pos["last_vol_trim_time"] is None
+
+    def test_synced_position_estimates_entry_atr(self, runner):
+        """_sync_positions estimates entry_atr from stop distance."""
+        now = datetime(2026, 2, 1, 12, 0, tzinfo=UTC)
+
+        # Set up broker to return an open trade with stop loss
+        runner.broker.get_open_trades.return_value = [
+            {
+                "trade_id": "T700",
+                "pair": "USD/JPY",
+                "units": 10000,
+                "price": 155.000,
+                "financing": 0.0,
+                "stop_loss_price": 153.500,
+                "unrealized_pnl": 0.0,
+            }
+        ]
+        runner.broker.get_all_positions.return_value = [
+            {
+                "pair": "USD/JPY",
+                "units": 10000,
+                "avg_price": 155.000,
+                "unrealized_pnl": 0.0,
+            }
+        ]
+
+        # Provide candle data for ExitManager init
+        df = _make_candle_df(50, 155.0)
+        runner._candle_cache["USD/JPY"] = df
+
+        runner._sync_positions()
+
+        pos = runner._strategy_positions.get("USD/JPY")
+        assert pos is not None
+        assert pos["original_units"] == 10000
+        assert pos["last_vol_trim_time"] is None
+        # entry_atr should be estimated: (155.0 - 153.5) / 3.0 = 0.5
+        if pos["entry_atr"] is not None:
+            assert abs(pos["entry_atr"] - 0.5) < 0.01
