@@ -294,6 +294,26 @@ class TestProtocolRestore:
         assert len(runner2.protocol.days) == 1
 
 
+def _make_candle_df(n_bars: int = 50, base_price: float = 155.0) -> pd.DataFrame:
+    """Helper: create a minimal candle DataFrame for stop calculations."""
+    import numpy as np
+
+    rng = np.random.default_rng(42)
+    closes = base_price + np.cumsum(rng.normal(0, 0.1, n_bars))
+    highs = closes + rng.uniform(0.1, 0.5, n_bars)
+    lows = closes - rng.uniform(0.1, 0.5, n_bars)
+    return pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2026-01-01", periods=n_bars, freq="h"),
+            "open": closes - rng.uniform(-0.1, 0.1, n_bars),
+            "high": highs,
+            "low": lows,
+            "close": closes,
+            "volume": [1000] * n_bars,
+        }
+    )
+
+
 class TestCloseAllPositions:
     """Tests for emergency position closing."""
 
@@ -332,3 +352,373 @@ class TestCloseAllPositions:
 
         runner._close_all_positions("abort")
         assert len(runner._strategy_positions) == 0
+
+
+class TestSafeAbort:
+    """Tests for Phase 4: safe abort with stop tightening."""
+
+    def test_tighten_all_stops_sets_1x_atr(self, runner):
+        """Stops should be tightened to 1x ATR before abort."""
+        df = _make_candle_df(50, base_price=155.0)
+        runner._candle_cache["USD/JPY"] = df
+
+        runner._strategy_positions = {
+            "USD/JPY": {
+                "entry_price": 154.0,
+                "entry_time": datetime.now(UTC),
+                "units": 10000,
+                "trade_id": "T100",
+                "stop_price": 150.0,  # Wide 3x ATR stop
+                "high_water_mark": 155.5,
+                "low_water_mark": 153.0,
+            },
+        }
+        runner.broker.modify_trade_stop_loss.return_value = True
+
+        runner._tighten_all_stops()
+
+        # Should have called modify_trade_stop_loss
+        runner.broker.modify_trade_stop_loss.assert_called_once()
+        call_args = runner.broker.modify_trade_stop_loss.call_args
+        new_stop = (
+            call_args[1]["stop_price"]
+            if "stop_price" in call_args[1]
+            else call_args[0][1]
+        )
+
+        # New stop should be ABOVE old stop (150.0) — tighter
+        assert new_stop > 150.0
+        # Position dict should be updated
+        assert runner._strategy_positions["USD/JPY"]["stop_price"] == new_stop
+
+    def test_tighten_skips_already_tighter_stop(self, runner):
+        """If existing stop is already tighter than 1x ATR, skip."""
+        df = _make_candle_df(50, base_price=155.0)
+        runner._candle_cache["USD/JPY"] = df
+
+        runner._strategy_positions = {
+            "USD/JPY": {
+                "entry_price": 154.0,
+                "entry_time": datetime.now(UTC),
+                "units": 10000,
+                "trade_id": "T100",
+                "stop_price": 999.0,  # Artificially high stop
+                "high_water_mark": 155.5,
+                "low_water_mark": 153.0,
+            },
+        }
+
+        runner._tighten_all_stops()
+
+        # Should NOT call modify because existing stop is already above 1x ATR
+        runner.broker.modify_trade_stop_loss.assert_not_called()
+
+    def test_tighten_skips_no_trade_id(self, runner):
+        """Positions without trade_id should be skipped gracefully."""
+        df = _make_candle_df(50, base_price=155.0)
+        runner._candle_cache["USD/JPY"] = df
+
+        runner._strategy_positions = {
+            "USD/JPY": {
+                "entry_price": 154.0,
+                "entry_time": datetime.now(UTC),
+                "units": 10000,
+                "trade_id": None,
+                "stop_price": 150.0,
+                "high_water_mark": 155.5,
+                "low_water_mark": 153.0,
+            },
+        }
+
+        runner._tighten_all_stops()
+        runner.broker.modify_trade_stop_loss.assert_not_called()
+
+    def test_tighten_falls_back_to_trade_ids_list(self, runner):
+        """Should use trade_ids list when trade_id is None."""
+        df = _make_candle_df(50, base_price=155.0)
+        runner._candle_cache["USD/JPY"] = df
+
+        runner._strategy_positions = {
+            "USD/JPY": {
+                "entry_price": 154.0,
+                "entry_time": datetime.now(UTC),
+                "units": 10000,
+                "trade_id": None,
+                "trade_ids": ["T200", "T201"],
+                "stop_price": 150.0,
+                "high_water_mark": 155.5,
+                "low_water_mark": 153.0,
+            },
+        }
+        runner.broker.modify_trade_stop_loss.return_value = True
+
+        runner._tighten_all_stops()
+
+        # Should have called at least once (primary) + once for extra
+        assert runner.broker.modify_trade_stop_loss.call_count >= 1
+
+    def test_tighten_fetches_candles_if_no_cache(self, runner):
+        """Should fetch candles from broker if cache is empty."""
+        df = _make_candle_df(50, base_price=155.0)
+        runner.broker.fetch_candles.return_value = df
+
+        runner._strategy_positions = {
+            "USD/JPY": {
+                "entry_price": 154.0,
+                "entry_time": datetime.now(UTC),
+                "units": 10000,
+                "trade_id": "T100",
+                "stop_price": 150.0,
+                "high_water_mark": 155.5,
+                "low_water_mark": 153.0,
+            },
+        }
+        runner.broker.modify_trade_stop_loss.return_value = True
+
+        runner._tighten_all_stops()
+
+        # Should have fetched candles since cache was empty
+        runner.broker.fetch_candles.assert_called_once_with(
+            "USD/JPY", count=50, granularity="H1"
+        )
+
+    def test_tighten_handles_broker_failure(self, runner):
+        """If modify_trade_stop_loss fails, should not crash."""
+        df = _make_candle_df(50, base_price=155.0)
+        runner._candle_cache["USD/JPY"] = df
+
+        runner._strategy_positions = {
+            "USD/JPY": {
+                "entry_price": 154.0,
+                "entry_time": datetime.now(UTC),
+                "units": 10000,
+                "trade_id": "T100",
+                "stop_price": 150.0,
+                "high_water_mark": 155.5,
+                "low_water_mark": 153.0,
+            },
+        }
+        runner.broker.modify_trade_stop_loss.return_value = False
+
+        # Should not raise
+        runner._tighten_all_stops()
+
+    def test_close_all_tightens_before_closing(self, runner):
+        """_close_all_positions should tighten stops first."""
+        df = _make_candle_df(50, base_price=155.0)
+        runner._candle_cache["USD/JPY"] = df
+
+        runner._strategy_positions = {
+            "USD/JPY": {
+                "entry_price": 154.0,
+                "entry_time": datetime.now(UTC),
+                "units": 10000,
+                "trade_id": "T100",
+                "stop_price": 150.0,
+                "high_water_mark": 155.5,
+                "low_water_mark": 153.0,
+            },
+        }
+        runner.broker.modify_trade_stop_loss.return_value = True
+
+        fill = Fill(
+            fill_id="x",
+            order_id="y",
+            timestamp=datetime.now(),
+            price=155.0,
+            quantity=10000,
+            commission=0,
+            slippage=0,
+        )
+        order = Order(
+            pair="USD/JPY",
+            side=OrderSide.SELL,
+            order_type=MagicMock(),
+            quantity=10000,
+            status=OrderStatus.FILLED,
+            fills=[fill],
+        )
+        runner.broker.close_position.return_value = order
+
+        runner._close_all_positions("abort test")
+
+        # Stops should be tightened AND position should be closed
+        runner.broker.modify_trade_stop_loss.assert_called()
+        runner.broker.close_position.assert_called()
+        assert len(runner._strategy_positions) == 0
+
+    def test_close_all_continues_on_partial_failure(self, runner):
+        """If one position fails to close, others should still close."""
+        df_usd = _make_candle_df(50, base_price=155.0)
+        df_aud = _make_candle_df(50, base_price=98.0)
+        runner._candle_cache["USD/JPY"] = df_usd
+        runner._candle_cache["AUD/JPY"] = df_aud
+
+        runner._strategy_positions = {
+            "USD/JPY": {
+                "entry_price": 154.0,
+                "entry_time": datetime.now(UTC),
+                "units": 10000,
+                "trade_id": "T100",
+                "stop_price": 150.0,
+                "high_water_mark": 155.5,
+                "low_water_mark": 153.0,
+            },
+            "AUD/JPY": {
+                "entry_price": 97.0,
+                "entry_time": datetime.now(UTC),
+                "units": 10000,
+                "trade_id": "T200",
+                "stop_price": 94.0,
+                "high_water_mark": 98.5,
+                "low_water_mark": 96.5,
+            },
+        }
+        runner.broker.modify_trade_stop_loss.return_value = True
+
+        # First close succeeds, second raises
+        fill = Fill(
+            fill_id="x",
+            order_id="y",
+            timestamp=datetime.now(),
+            price=155.0,
+            quantity=10000,
+            commission=0,
+            slippage=0,
+        )
+        order = Order(
+            pair="USD/JPY",
+            side=OrderSide.SELL,
+            order_type=MagicMock(),
+            quantity=10000,
+            status=OrderStatus.FILLED,
+            fills=[fill],
+        )
+
+        def close_side_effect(pair, **kwargs):
+            if pair == "AUD/JPY":
+                raise ConnectionError("Broker unreachable")
+            return order
+
+        runner.broker.close_position.side_effect = close_side_effect
+
+        # Should not crash — AUD/JPY stays with tight stop
+        runner._close_all_positions("abort test")
+
+        # AUD/JPY should still be in positions (close failed)
+        assert "AUD/JPY" in runner._strategy_positions
+
+    def test_close_all_alerts_on_partial_failure(self, runner):
+        """Telegram alert should fire when some positions fail to close."""
+        df = _make_candle_df(50, base_price=155.0)
+        runner._candle_cache["USD/JPY"] = df
+
+        runner._strategy_positions = {
+            "USD/JPY": {
+                "entry_price": 154.0,
+                "entry_time": datetime.now(UTC),
+                "units": 10000,
+                "trade_id": "T100",
+                "stop_price": 150.0,
+                "high_water_mark": 155.5,
+                "low_water_mark": 153.0,
+            },
+        }
+        runner.broker.modify_trade_stop_loss.return_value = True
+        runner.broker.close_position.side_effect = ConnectionError("timeout")
+
+        # Set up alert manager mock
+        runner.alert_manager = MagicMock()
+
+        runner._close_all_positions("test abort")
+
+        # Alert should have been sent about the failure
+        runner.alert_manager.send.assert_called()
+        call_args = runner.alert_manager.send.call_args
+        assert "CRITICAL" == call_args[0][0]
+        assert "Partial Close Failure" in call_args[0][1]
+
+    def test_close_all_no_positions(self, runner):
+        """Should handle empty positions gracefully."""
+        runner._strategy_positions = {}
+        runner._close_all_positions("test abort")
+        runner.broker.modify_trade_stop_loss.assert_not_called()
+        runner.broker.close_position.assert_not_called()
+
+    def test_tighten_multiple_pairs(self, runner):
+        """Should tighten stops on all positions independently."""
+        df_usd = _make_candle_df(50, base_price=155.0)
+        df_aud = _make_candle_df(50, base_price=98.0)
+        runner._candle_cache["USD/JPY"] = df_usd
+        runner._candle_cache["AUD/JPY"] = df_aud
+
+        runner._strategy_positions = {
+            "USD/JPY": {
+                "entry_price": 154.0,
+                "entry_time": datetime.now(UTC),
+                "units": 10000,
+                "trade_id": "T100",
+                "stop_price": 150.0,
+                "high_water_mark": 155.5,
+                "low_water_mark": 153.0,
+            },
+            "AUD/JPY": {
+                "entry_price": 97.0,
+                "entry_time": datetime.now(UTC),
+                "units": 10000,
+                "trade_id": "T200",
+                "stop_price": 94.0,
+                "high_water_mark": 98.5,
+                "low_water_mark": 96.5,
+            },
+        }
+        runner.broker.modify_trade_stop_loss.return_value = True
+
+        runner._tighten_all_stops()
+
+        # Should have tightened both pairs
+        assert runner.broker.modify_trade_stop_loss.call_count == 2
+
+    def test_tighten_handles_exception_per_pair(self, runner):
+        """An exception on one pair should not prevent tightening others."""
+        df_usd = _make_candle_df(50, base_price=155.0)
+        df_aud = _make_candle_df(50, base_price=98.0)
+        runner._candle_cache["USD/JPY"] = df_usd
+        runner._candle_cache["AUD/JPY"] = df_aud
+
+        runner._strategy_positions = {
+            "USD/JPY": {
+                "entry_price": 154.0,
+                "entry_time": datetime.now(UTC),
+                "units": 10000,
+                "trade_id": "T100",
+                "stop_price": 150.0,
+                "high_water_mark": 155.5,
+                "low_water_mark": 153.0,
+            },
+            "AUD/JPY": {
+                "entry_price": 97.0,
+                "entry_time": datetime.now(UTC),
+                "units": 10000,
+                "trade_id": "T200",
+                "stop_price": 94.0,
+                "high_water_mark": 98.5,
+                "low_water_mark": 96.5,
+            },
+        }
+
+        call_count = [0]
+
+        def modify_side_effect(trade_id, stop_price):
+            call_count[0] += 1
+            if trade_id == "T100":
+                raise ConnectionError("timeout")
+            return True
+
+        runner.broker.modify_trade_stop_loss.side_effect = modify_side_effect
+
+        # Should not crash
+        runner._tighten_all_stops()
+
+        # Should have attempted both
+        assert call_count[0] == 2

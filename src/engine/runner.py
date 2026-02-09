@@ -1241,15 +1241,189 @@ class TradingRunner:
                         position["units"],
                     )
 
+    def _tighten_all_stops(self) -> None:
+        """Tighten all broker-side stops to 1x ATR (safety net before abort).
+
+        Called before attempting to close all positions so that if any
+        market-close order fails (broker timeout, network issue, etc.),
+        the surviving positions have tight stops instead of the normal
+        3x ATR. This limits worst-case slippage on unprotected
+        positions during abort.
+
+        Uses cached candle data when available; falls back to a fresh
+        fetch if the cache is empty. Failures on individual pairs are
+        logged but do not prevent the abort sequence from continuing.
+        """
+        from src.strategy.indicators import atr as calc_atr
+
+        tightened = 0
+        failed = 0
+
+        for pair, pos in self._strategy_positions.items():
+            try:
+                trade_id = pos.get("trade_id")
+                if trade_id is None:
+                    # Try to get trade IDs from the list if available
+                    trade_ids = pos.get("trade_ids", [])
+                    if trade_ids:
+                        trade_id = trade_ids[0]
+                    else:
+                        logger.warning("No trade_id for %s, cannot tighten stop", pair)
+                        failed += 1
+                        continue
+
+                # Use cached candles first, fall back to fresh fetch
+                df = self._candle_cache.get(pair)
+                if df is None or len(df) < 20:
+                    df = self.broker.fetch_candles(pair, count=50, granularity="H1")
+                if df is None or len(df) < 20:
+                    logger.warning("No candle data for %s, cannot tighten stop", pair)
+                    failed += 1
+                    continue
+
+                current_price = float(df["close"].iloc[-1])
+                atr_vals = calc_atr(df["high"], df["low"], df["close"])
+                current_atr = float(atr_vals.iloc[-1])
+
+                if np.isnan(current_atr) or current_atr <= 0:
+                    logger.warning("Invalid ATR for %s, cannot tighten stop", pair)
+                    failed += 1
+                    continue
+
+                # 1x ATR stop — tight protection
+                tight_stop = round(current_price - current_atr, 3)
+
+                # Only tighten (move stop UP), never loosen
+                current_stop = pos.get("stop_price")
+                if current_stop is not None and tight_stop <= current_stop:
+                    logger.debug(
+                        "Stop for %s already tighter (%.3f >= %.3f)",
+                        pair,
+                        current_stop,
+                        tight_stop,
+                    )
+                    tightened += 1
+                    continue
+
+                success = self.broker.modify_trade_stop_loss(
+                    trade_id=trade_id,
+                    stop_price=tight_stop,
+                )
+                if success:
+                    old_stop = current_stop or 0.0
+                    pos["stop_price"] = tight_stop
+                    tightened += 1
+                    logger.info(
+                        "Tightened stop %s: %.3f → %.3f (1x ATR, price=%.3f, ATR=%.3f)",
+                        pair,
+                        old_stop,
+                        tight_stop,
+                        current_price,
+                        current_atr,
+                    )
+                else:
+                    failed += 1
+                    logger.error(
+                        "Failed to tighten stop for %s (trade %s)",
+                        pair,
+                        trade_id,
+                    )
+
+                # Also tighten stops on scale-in trades
+                for extra_id in pos.get("trade_ids", []):
+                    if extra_id == trade_id:
+                        continue
+                    try:
+                        self.broker.modify_trade_stop_loss(
+                            trade_id=extra_id,
+                            stop_price=tight_stop,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "Failed to tighten scale-in stop %s: %s",
+                            extra_id,
+                            e,
+                        )
+
+            except Exception as e:
+                failed += 1
+                logger.error("Error tightening stop for %s: %s", pair, e)
+
+        logger.info(
+            "Stop tightening complete: %d tightened, %d failed (of %d)",
+            tightened,
+            failed,
+            len(self._strategy_positions),
+        )
+
     def _close_all_positions(self, reason: str) -> None:
-        """Close all open positions (emergency/abort)."""
+        """Close all open positions with safety-net stop tightening.
+
+        Safe abort sequence:
+        1. Tighten all broker-side stops to 1x ATR (safety net)
+        2. Attempt market-close on each position
+        3. Track and alert on any positions that failed to close
+           (these remain with tight 1x ATR stops as protection)
+
+        Args:
+            reason: Abort reason for logging and alerts.
+        """
         now = datetime.now(UTC)
         pairs = list(self._strategy_positions.keys())
+
+        if not pairs:
+            logger.info("No positions to close during abort")
+            return
+
+        # Step 1: Tighten all stops BEFORE attempting closes
+        logger.info(
+            "Safe abort: tightening stops on %d positions before closing",
+            len(pairs),
+        )
+        try:
+            self._tighten_all_stops()
+        except Exception as e:
+            logger.error(
+                "Stop tightening sweep failed: %s (proceeding with closes)",
+                e,
+            )
+
+        # Step 2: Attempt to close each position
+        closed = []
+        failed_pairs = []
+
         for pair in pairs:
             try:
                 self._close_position(pair, reason, now)
+                closed.append(pair)
             except Exception as e:
-                logger.error("Failed to close %s during abort: %s", pair, e)
+                failed_pairs.append(pair)
+                logger.error(
+                    "Failed to close %s during abort: %s "
+                    "(position has tight 1x ATR stop as safety net)",
+                    pair,
+                    e,
+                )
+
+        # Step 3: Report results
+        logger.info(
+            "Abort close results: %d/%d closed, %d failed",
+            len(closed),
+            len(pairs),
+            len(failed_pairs),
+        )
+
+        # Alert on partial failures
+        if failed_pairs and self.alert_manager:
+            self.alert_manager.send(
+                "CRITICAL",
+                "Abort: Partial Close Failure",
+                f"Failed to close {len(failed_pairs)} position(s): "
+                f"{', '.join(failed_pairs)}\n\n"
+                f"These positions have TIGHT 1x ATR stops as safety net.\n"
+                f"Manual intervention may be required.\n\n"
+                f"Reason: {reason}",
+            )
 
     def _sync_positions(self) -> None:
         """Sync internal state with OANDA's actual positions and trades.
