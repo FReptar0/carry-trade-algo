@@ -10,20 +10,24 @@ periodic execution.
 Tick workflow (every hour):
 1. Reconcile positions with broker
 2. Check if market is open (skip if closed)
-3. Fetch latest candles from OANDA for each pair
-4. Update correlation monitor
-5. Check economic calendar blackout (skip new entries if active)
-6. Run V3 strategy on candle data
-7. Run signal filter (bandit gate)
-8. Execute signal via OANDA with dynamic sizing
-9. Check scale-in/scale-out for existing positions
-10. Update performance monitor
-11. Check circuit breakers
-12. Check protocol abort conditions
-12b. Update broker-side stop-losses (trailing / ratchet)
-13. Save state to SQLite
-14. Watchdog heartbeat
-15. Log tick summary
+3. Check protocol status (RUNNING or DEGRADED allowed; DEGRADED
+   blocks new entries and scale-in but manages existing positions)
+4. Fetch latest candles from OANDA for each pair
+5. Update correlation monitor
+6. Check economic calendar blackout (skip new entries if active)
+7. Run V3 strategy on candle data
+8. Run signal filter (bandit gate)
+9. Execute signal via OANDA with dynamic sizing
+10. Check scale-in/scale-out for existing positions
+11. Update performance monitor
+12. Check circuit breakers
+12b. Check degradation conditions (RUNNING → DEGRADED)
+12c. Check recovery conditions (DEGRADED → RUNNING)
+13. Check protocol abort conditions (from RUNNING or DEGRADED)
+13b. Update broker-side stop-losses (trailing / ratchet)
+14. Save state to SQLite
+15. Watchdog heartbeat
+16. Log tick summary
 """
 
 from __future__ import annotations
@@ -262,21 +266,25 @@ class TradingRunner:
     def _restore_or_create_protocol(self) -> TradingProtocol:
         """Load protocol from database or create a new one.
 
-        If the protocol was previously aborted, reset it to running
-        so the 30-day evaluation can continue. All daily history,
-        start date, and checkpoints are preserved.
+        If the protocol was previously aborted, reset it to DEGRADED
+        (not RUNNING) so positions are managed defensively. Recovery
+        to RUNNING happens automatically when conditions clear.
         """
         protocol = self.store.load_protocol_state()
         if protocol is not None:
             if protocol.status == ProtocolStatus.ABORTED:
                 logger.warning(
                     "Protocol was aborted (%s) — resuming as "
-                    "running (day %d/%d, history preserved)",
+                    "DEGRADED (day %d/%d, history preserved)",
                     protocol.abort_reason,
                     len(protocol.days),
                     protocol.duration,
                 )
-                protocol.status = ProtocolStatus.RUNNING
+                protocol.status = ProtocolStatus.DEGRADED
+                protocol.degraded_reason = (
+                    f"Resumed after abort: {protocol.abort_reason}"
+                )
+                protocol.degraded_since = datetime.now()
                 protocol.abort_reason = None
                 protocol.end_date = None
                 self.store.save_protocol_state(protocol)
@@ -451,9 +459,12 @@ class TradingRunner:
             return
 
         # 2. Check protocol status
-        if self.protocol.status.value not in ("running",):
+        if self.protocol.status not in (
+            ProtocolStatus.RUNNING,
+            ProtocolStatus.DEGRADED,
+        ):
             logger.info(
-                "Protocol not running (status=%s), skipping",
+                "Protocol not active (status=%s), skipping",
                 self.protocol.status.value,
             )
             # Still record heartbeat so the watchdog knows the
@@ -545,7 +556,36 @@ class TradingRunner:
         snapshot = self.monitor.get_snapshot()
         self._max_drawdown_today = max(self._max_drawdown_today, snapshot.drawdown)
 
-        # 11. Check protocol abort
+        # 10b. Check degraded conditions (RUNNING → DEGRADED)
+        if self.protocol.status == ProtocolStatus.RUNNING and self.protocol.days:
+            should_degrade, degrade_reason = self.protocol.check_degraded_conditions()
+            if should_degrade and degrade_reason:
+                logger.warning("Protocol degrading: %s", degrade_reason)
+                self.protocol.degrade(degrade_reason)
+                self.store.save_protocol_state(self.protocol)
+                if self.alert_manager:
+                    self.alert_manager.send(
+                        "HIGH",
+                        "Protocol DEGRADED",
+                        f"Entering defensive mode: {degrade_reason}\n"
+                        "No new entries. Existing positions managed.",
+                    )
+
+        # 10c. Check recovery conditions (DEGRADED → RUNNING)
+        if self.protocol.status == ProtocolStatus.DEGRADED and self.protocol.days:
+            can_recover, recover_reason = self.protocol.check_recovery_conditions()
+            if can_recover and recover_reason:
+                logger.info("Protocol recovering: %s", recover_reason)
+                self.protocol.recover()
+                self.store.save_protocol_state(self.protocol)
+                if self.alert_manager:
+                    self.alert_manager.send(
+                        "INFO",
+                        "Protocol RECOVERED",
+                        f"Resuming full trading: {recover_reason}",
+                    )
+
+        # 11. Check protocol abort (fires from both RUNNING and DEGRADED)
         if self.protocol.days:
             should_abort, reason = self.protocol.check_abort_conditions()
             if should_abort and reason:
@@ -648,11 +688,23 @@ class TradingRunner:
         has_position = pair in self._strategy_positions
 
         # Phase D: Check scale-in/scale-out for existing positions
+        # Note: scale-out (profit-taking) is allowed in DEGRADED; scale-in is blocked
         if has_position and self.config.enable_scaling:
-            self._check_scaling(pair, df)
+            if self.protocol.status == ProtocolStatus.DEGRADED:
+                # Only allow scale-out (reduction), skip scale-in
+                self._check_scaling(pair, df, scale_in_allowed=False)
+            else:
+                self._check_scaling(pair, df)
 
         if last_signal.signal == Signal.LONG and not has_position:
             # New entry signal
+            if self.protocol.status == ProtocolStatus.DEGRADED:
+                logger.info(
+                    "Skipping entry for %s (DEGRADED mode — no new entries)",
+                    pair,
+                )
+                return
+
             if in_blackout:
                 logger.info("Skipping entry for %s (blackout)", pair)
                 return
@@ -930,12 +982,18 @@ class TradingRunner:
             reason,
         )
 
-    def _check_scaling(self, pair: str, df: pd.DataFrame) -> None:
+    def _check_scaling(
+        self,
+        pair: str,
+        df: pd.DataFrame,
+        scale_in_allowed: bool = True,
+    ) -> None:
         """Check for scale-in/scale-out opportunities.
 
         Args:
             pair: Currency pair with open position.
             df: Current candle data.
+            scale_in_allowed: If False, skip scale-in (DEGRADED mode).
         """
         position = self._strategy_positions.get(pair)
         if position is None:
@@ -951,7 +1009,9 @@ class TradingRunner:
             return
 
         # Check scale-in
-        if self.scale_manager.should_add(position, current_price, current_atr):
+        if scale_in_allowed and self.scale_manager.should_add(
+            position, current_price, current_atr
+        ):
             add_units = self.scale_manager.tranche_units(position["units"])
 
             # Calculate broker-side stop for the new tranche
@@ -1301,7 +1361,10 @@ class TradingRunner:
             circuit_breaker_triggered=self._cb_triggered_today,
         )
 
-        if self.protocol.status.value == "running":
+        if self.protocol.status in (
+            ProtocolStatus.RUNNING,
+            ProtocolStatus.DEGRADED,
+        ):
             self.protocol.record_day(day)
 
             # Check for checkpoint days
@@ -1390,6 +1453,16 @@ class TradingRunner:
             self.protocol.duration,
             progress["status"],
         )
+
+        # Log degraded state details
+        if self.protocol.status == ProtocolStatus.DEGRADED:
+            logger.info(
+                "DEGRADED mode active: %s (since %s)",
+                self.protocol.degraded_reason or "unknown",
+                self.protocol.degraded_since.isoformat()
+                if self.protocol.degraded_since
+                else "unknown",
+            )
 
         # Check for market open/close transitions
         self._check_market_transition()

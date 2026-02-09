@@ -38,6 +38,7 @@ class ProtocolStatus(Enum):
 
     NOT_STARTED = "not_started"
     RUNNING = "running"
+    DEGRADED = "degraded"  # Defensive mode: manage existing, no new entries
     PAUSED = "paused"
     ABORTED = "aborted"
     COMPLETED = "completed"
@@ -88,6 +89,30 @@ class ProtocolCheckpoint:
 
 
 @dataclass
+class DegradedCriteria:
+    """Softer thresholds that trigger DEGRADED mode (warning layer).
+
+    These fire *before* AbortCriteria and shift the protocol into a
+    defensive posture: existing positions are managed (stops trail,
+    exits fire) but no new entries are allowed.
+    """
+
+    max_drawdown: float = 0.10  # 10% drawdown (abort at 15%)
+    consecutive_losing_days: int = 3  # 3 losing days (abort at 5)
+    circuit_breaker_count: int = 1  # 1 CB trigger in a day (abort at 3 cumulative)
+    min_win_rate: float = 0.30  # 30% win rate warning (abort at 20%)
+
+
+@dataclass
+class RecoveryCriteria:
+    """Conditions to recover from DEGRADED back to RUNNING."""
+
+    max_drawdown: float = 0.08  # Must improve below 8%
+    consecutive_profitable_days: int = 1  # At least 1 profitable day
+    no_circuit_breaker_days: int = 1  # 1 full day without CB triggers
+
+
+@dataclass
 class AbortCriteria:
     """Criteria for auto-aborting the protocol."""
 
@@ -126,10 +151,14 @@ class TradingProtocol:
         self,
         duration_days: int = 30,
         abort_criteria: AbortCriteria | None = None,
+        degraded_criteria: DegradedCriteria | None = None,
+        recovery_criteria: RecoveryCriteria | None = None,
         initial_equity: float = 100000.0,
     ) -> None:
         self.duration = duration_days
         self.abort_criteria = abort_criteria or AbortCriteria()
+        self.degraded_criteria = degraded_criteria or DegradedCriteria()
+        self.recovery_criteria = recovery_criteria or RecoveryCriteria()
         self.initial_equity = initial_equity
 
         self.days: list[ProtocolDay] = []
@@ -138,6 +167,10 @@ class TradingProtocol:
         self.start_date: Optional[date] = None
         self.end_date: Optional[date] = None
         self.abort_reason: Optional[str] = None
+
+        # Degraded mode tracking
+        self.degraded_reason: Optional[str] = None
+        self.degraded_since: Optional[datetime] = None
 
     def start(self) -> None:
         """Start the protocol."""
@@ -149,7 +182,7 @@ class TradingProtocol:
 
     def record_day(self, day_result: ProtocolDay) -> None:
         """Record a day's results."""
-        if self.status != ProtocolStatus.RUNNING:
+        if self.status not in (ProtocolStatus.RUNNING, ProtocolStatus.DEGRADED):
             raise ValueError(f"Cannot record day when status is {self.status}")
 
         self.days.append(day_result)
@@ -194,6 +227,116 @@ class TradingProtocol:
                 return True, f"Win rate too low: {win_rate:.1%}"
 
         return False, None
+
+    def check_degraded_conditions(self) -> tuple[bool, Optional[str]]:
+        """Check if protocol should enter DEGRADED mode.
+
+        These are softer thresholds that fire before abort. They act as
+        an early-warning layer: block new entries while managing exits.
+
+        Returns:
+            Tuple of (should_degrade, reason).
+        """
+        if len(self.days) == 0:
+            return False, None
+
+        # Already degraded or worse — skip
+        if self.status not in (ProtocolStatus.RUNNING,):
+            return False, None
+
+        criteria = self.degraded_criteria
+
+        # 1. Drawdown warning (10%)
+        current_equity = self.days[-1].ending_equity
+        peak_equity = max(d.ending_equity for d in self.days)
+        drawdown = (peak_equity - current_equity) / peak_equity
+
+        if drawdown > criteria.max_drawdown:
+            return (
+                True,
+                f"Drawdown warning: {drawdown:.1%} > {criteria.max_drawdown:.0%}",
+            )
+
+        # 2. Consecutive losing days (3)
+        if len(self.days) >= criteria.consecutive_losing_days:
+            recent = self.days[-criteria.consecutive_losing_days :]
+            if all(d.daily_pnl < 0 for d in recent):
+                return True, f"{len(recent)} consecutive losing days (warning)"
+
+        # 3. Circuit breaker triggered today
+        cb_count = sum(1 for d in self.days if d.circuit_breaker_triggered)
+        if cb_count >= criteria.circuit_breaker_count:
+            return True, f"Circuit breaker triggered {cb_count} times (warning)"
+
+        # 4. Low win rate (30%)
+        total_trades = sum(d.trades_closed for d in self.days)
+        if total_trades >= 10:
+            profitable_days = sum(1 for d in self.days if d.is_profitable)
+            win_rate = profitable_days / len(self.days)
+            if win_rate < criteria.min_win_rate:
+                return True, f"Win rate low: {win_rate:.1%} (warning)"
+
+        return False, None
+
+    def check_recovery_conditions(self) -> tuple[bool, Optional[str]]:
+        """Check if protocol can recover from DEGRADED to RUNNING.
+
+        Returns:
+            Tuple of (can_recover, reason).
+        """
+        if self.status != ProtocolStatus.DEGRADED:
+            return False, None
+
+        if len(self.days) == 0:
+            return False, None
+
+        criteria = self.recovery_criteria
+
+        # 1. Drawdown must improve below recovery threshold (8%)
+        current_equity = self.days[-1].ending_equity
+        peak_equity = max(d.ending_equity for d in self.days)
+        drawdown = (peak_equity - current_equity) / peak_equity
+
+        if drawdown > criteria.max_drawdown:
+            return False, None
+
+        # 2. At least N consecutive profitable days since degradation
+        if len(self.days) >= criteria.consecutive_profitable_days:
+            recent = self.days[-criteria.consecutive_profitable_days :]
+            if not all(d.daily_pnl >= 0 for d in recent):
+                return False, None
+        else:
+            return False, None
+
+        # 3. No circuit breaker triggers in last N days
+        if len(self.days) >= criteria.no_circuit_breaker_days:
+            recent_cb = self.days[-criteria.no_circuit_breaker_days :]
+            if any(d.circuit_breaker_triggered for d in recent_cb):
+                return False, None
+        else:
+            return False, None
+
+        return True, (
+            f"Recovery: drawdown={drawdown:.1%}, "
+            f"last {criteria.consecutive_profitable_days} day(s) profitable, "
+            f"no CB in {criteria.no_circuit_breaker_days} day(s)"
+        )
+
+    def degrade(self, reason: str) -> None:
+        """Transition protocol to DEGRADED mode.
+
+        Args:
+            reason: Why the protocol entered degraded mode.
+        """
+        self.status = ProtocolStatus.DEGRADED
+        self.degraded_reason = reason
+        self.degraded_since = datetime.now()
+
+    def recover(self) -> None:
+        """Recover from DEGRADED back to RUNNING."""
+        self.status = ProtocolStatus.RUNNING
+        self.degraded_reason = None
+        self.degraded_since = None
 
     def run_checkpoint(self, day_num: int) -> ProtocolCheckpoint:
         """Run checkpoint analysis.
@@ -373,6 +516,7 @@ class TradingProtocol:
             "current_equity": current_equity,
             "current_return": current_return,
             "next_checkpoint": self._next_checkpoint(),
+            "degraded_reason": self.degraded_reason,
         }
 
     def _next_checkpoint(self) -> Optional[int]:

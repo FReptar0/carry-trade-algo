@@ -43,6 +43,7 @@ class StateStore:
         self.db_path = db_path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
+        self._migrate_db()
 
     def _get_conn(self) -> sqlite3.Connection:
         """Get a database connection."""
@@ -127,6 +128,23 @@ class StateStore:
         finally:
             conn.close()
 
+    def _migrate_db(self) -> None:
+        """Apply incremental schema migrations."""
+        conn = self._get_conn()
+        try:
+            # Add degraded_reason column if missing (Phase 2 hardening)
+            cols = [
+                row[1]
+                for row in conn.execute("PRAGMA table_info(protocol_state)").fetchall()
+            ]
+            if "degraded_reason" not in cols:
+                conn.execute(
+                    "ALTER TABLE protocol_state ADD COLUMN degraded_reason TEXT"
+                )
+                conn.commit()
+        finally:
+            conn.close()
+
     def save_protocol_state(self, protocol: TradingProtocol) -> None:
         """Persist the current protocol state.
 
@@ -139,18 +157,18 @@ class StateStore:
                 """
                 INSERT OR REPLACE INTO protocol_state
                 (id, status, start_date, duration_days, initial_equity,
-                 abort_reason, max_drawdown_limit, consecutive_losing_limit,
+                 abort_reason, degraded_reason,
+                 max_drawdown_limit, consecutive_losing_limit,
                  circuit_breaker_limit, min_win_rate_limit, updated_at)
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     protocol.status.value,
-                    protocol.start_date.isoformat()
-                    if protocol.start_date
-                    else None,
+                    protocol.start_date.isoformat() if protocol.start_date else None,
                     protocol.duration,
                     protocol.initial_equity,
                     protocol.abort_reason,
+                    protocol.degraded_reason,
                     protocol.abort_criteria.max_drawdown,
                     protocol.abort_criteria.consecutive_losing_days,
                     protocol.abort_criteria.circuit_breaker_count,
@@ -170,9 +188,7 @@ class StateStore:
         """
         conn = self._get_conn()
         try:
-            row = conn.execute(
-                "SELECT * FROM protocol_state WHERE id = 1"
-            ).fetchone()
+            row = conn.execute("SELECT * FROM protocol_state WHERE id = 1").fetchone()
             if row is None:
                 return None
 
@@ -193,11 +209,10 @@ class StateStore:
             if row["start_date"]:
                 protocol.start_date = date.fromisoformat(row["start_date"])
             protocol.abort_reason = row["abort_reason"]
+            protocol.degraded_reason = row["degraded_reason"]
 
             # Restore daily results
-            days = conn.execute(
-                "SELECT * FROM daily_results ORDER BY date"
-            ).fetchall()
+            days = conn.execute("SELECT * FROM daily_results ORDER BY date").fetchall()
             for d in days:
                 protocol.days.append(
                     ProtocolDay(
@@ -210,9 +225,7 @@ class StateStore:
                         trades_closed=d["trades_closed"],
                         max_drawdown_today=d["max_drawdown_today"],
                         regime=d["regime"],
-                        circuit_breaker_triggered=bool(
-                            d["circuit_breaker_triggered"]
-                        ),
+                        circuit_breaker_triggered=bool(d["circuit_breaker_triggered"]),
                         notes=d["notes"] or "",
                     )
                 )
@@ -394,8 +407,7 @@ class StateStore:
         conn = self._get_conn()
         try:
             row = conn.execute(
-                "SELECT equity FROM equity_snapshots "
-                "ORDER BY timestamp DESC LIMIT 1"
+                "SELECT equity FROM equity_snapshots ORDER BY timestamp DESC LIMIT 1"
             ).fetchone()
             return row["equity"] if row else None
         finally:
@@ -414,8 +426,7 @@ class StateStore:
         try:
             if pair:
                 rows = conn.execute(
-                    "SELECT * FROM trade_log WHERE pair = ? "
-                    "ORDER BY timestamp",
+                    "SELECT * FROM trade_log WHERE pair = ? ORDER BY timestamp",
                     (pair,),
                 ).fetchall()
             else:
