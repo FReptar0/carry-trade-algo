@@ -98,7 +98,7 @@ class TestDailySummaryFinancing:
             result = manager.send_daily_summary(snapshot)
             assert result is True
             call_text = mock.call_args[0][0]
-            assert "Carry Income" in call_text
+            assert "Carry" in call_text
             assert "15.73" in call_text
 
     def test_daily_summary_omits_financing_when_zero(self, manager):
@@ -114,7 +114,7 @@ class TestDailySummaryFinancing:
             result = manager.send_daily_summary(snapshot)
             assert result is True
             call_text = mock.call_args[0][0]
-            assert "Carry Income" not in call_text
+            assert "Carry" not in call_text
 
     def test_daily_summary_omits_financing_when_missing(self, manager):
         """Daily summary should handle missing financing key gracefully."""
@@ -128,4 +128,4 @@ class TestDailySummaryFinancing:
             result = manager.send_daily_summary(snapshot)
             assert result is True
             call_text = mock.call_args[0][0]
-            assert "Carry Income" not in call_text
+            assert "Carry" not in call_text

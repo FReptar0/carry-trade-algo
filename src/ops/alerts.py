@@ -117,17 +117,22 @@ class AlertManager:
         Returns:
             True if sent successfully.
         """
-        lines = [
-            "📊 *Daily Summary*",
-            "",
-            f"Equity: {snapshot.get('equity', 0):,.2f}",
-            f"Daily P&L: {snapshot.get('daily_pnl', 0):,.2f}",
-            f"Drawdown: {snapshot.get('drawdown', 0):.2%}",
-            f"Positions: {snapshot.get('positions_count', 0)}",
-        ]
+        equity = snapshot.get("equity", 0)
+        daily_pnl = snapshot.get("daily_pnl", 0)
+        drawdown = snapshot.get("drawdown", 0)
+        pos_count = snapshot.get("positions_count", 0)
         financing = snapshot.get("financing", 0)
+
+        pnl_emoji = "\U0001f7e2" if daily_pnl >= 0 else "\U0001f534"
+        lines = [
+            "\U0001f4ca *Daily Summary*",
+            f"\U0001f4b0 Equity: ${equity:,.2f}",
+            f"{pnl_emoji} P&L: ${daily_pnl:+,.2f}",
+            f"\U0001f4c9 Drawdown: {drawdown:.1%}",
+            f"\U0001f4cb Positions: {pos_count}",
+        ]
         if financing != 0:
-            lines.append(f"Carry Income: {financing:+,.2f}")
+            lines.append(f"\U0001f3e6 Carry: ${financing:+,.2f}")
         text = "\n".join(lines)
         return self._send_telegram(text)
 

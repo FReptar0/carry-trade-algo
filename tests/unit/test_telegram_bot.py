@@ -37,6 +37,7 @@ def _sample_state():
                 "high_water_mark": 153.200,
                 "entry_time": datetime(2026, 2, 3, 10, 0, tzinfo=UTC),
                 "tranche_count": 2,
+                "financing": 0,
             },
             {
                 "pair": "AUD/JPY",
@@ -48,14 +49,17 @@ def _sample_state():
                 "high_water_mark": 98.100,
                 "entry_time": datetime(2026, 2, 2, 14, 0, tzinfo=UTC),
                 "tranche_count": 3,
+                "financing": 0,
             },
         ],
         "performance": {
             "daily_pnl": 125.30,
             "high_water_mark": 100600.00,
+            "total_financing": 0,
         },
         "last_tick": datetime(2026, 2, 8, 15, 0, tzinfo=UTC),
         "market_open": True,
+        "pending_orders": {},
     }
 
 
@@ -117,7 +121,7 @@ class TestTelegramCommandBot:
         state = _sample_state()
         state["positions"] = []
         result = bot._handle_status(state)
-        assert "Positions (0)" in result
+        assert "0 Positions" in result
         assert "$+0.00" in result or "$0.00" in result
 
     def test_handle_health_connected(self, bot):
@@ -162,9 +166,9 @@ class TestTelegramCommandBot:
         result = bot._handle_positions(state)
         assert "USD/JPY" in result
         assert "AUD/JPY" in result
-        assert "tranches: 2" in result
-        assert "tranches: 3" in result
-        assert "Total PnL" in result
+        assert "2 tranches" in result
+        assert "3 tranches" in result
+        assert "Total" in result
 
     def test_handle_positions_empty(self, bot):
         """Positions command should handle no positions."""
@@ -177,8 +181,8 @@ class TestTelegramCommandBot:
         """Positions command should show risk from stop."""
         state = _sample_state()
         result = bot._handle_positions(state)
-        # USD/JPY: entry 152.5, stop 149.5 → risk ~1.97%
-        assert "risk:" in result
+        # USD/JPY: entry 152.5, stop 149.5 → risk ~2.0%
+        assert "risk" in result
 
     def test_handle_help(self, bot):
         """Help command should list all commands."""
@@ -274,7 +278,7 @@ class TestBotSecurity:
         with patch.object(bot, "_send_message") as mock_send:
             bot._process_update(update)
             mock_send.assert_called_once()
-            assert "CARRY TRADE STATUS" in mock_send.call_args[0][0]
+            assert "Equity" in mock_send.call_args[0][0]
 
 
 class TestBotLifecycle:
@@ -386,9 +390,8 @@ class TestFinancingDisplay:
         state["positions"][1]["financing"] = 7.25
         state["performance"]["total_financing"] = 12.75
         result = bot._handle_status(state)
-        assert "Carry income" in result
+        assert "Carry" in result
         assert "12.75" in result
-        assert "Total Carry" in result
 
     def test_status_hides_carry_when_zero(self, bot):
         """Status should not show carry income lines when financing is 0."""
@@ -397,16 +400,17 @@ class TestFinancingDisplay:
         state["positions"][1]["financing"] = 0
         state["performance"]["total_financing"] = 0
         result = bot._handle_status(state)
-        assert "Carry income" not in result
-        assert "Total Carry" not in result
+        # "Carry" should not appear in the performance footer
+        # (it may appear as header label "Positions" but not "Carry $")
+        assert "Carry $" not in result
 
     def test_positions_decomposes_pnl(self, bot):
         """Positions command should decompose PnL into price and carry."""
         state = _sample_state()
         state["positions"][0]["financing"] = 12.45
         result = bot._handle_positions(state)
-        assert "price:" in result
-        assert "carry:" in result
+        assert "price" in result
+        assert "carry" in result
         assert "12.45" in result
 
     def test_positions_shows_total_carry(self, bot):
@@ -415,7 +419,7 @@ class TestFinancingDisplay:
         state["positions"][0]["financing"] = 5.00
         state["positions"][1]["financing"] = 3.00
         result = bot._handle_positions(state)
-        assert "Total Carry" in result
+        assert "Carry" in result
         assert "8.00" in result
 
     def test_positions_hides_carry_when_zero(self, bot):
@@ -424,4 +428,62 @@ class TestFinancingDisplay:
         state["positions"][0]["financing"] = 0
         state["positions"][1]["financing"] = 0
         result = bot._handle_positions(state)
-        assert "Total Carry" not in result
+        assert "Carry $" not in result
+
+
+class TestPendingOrdersDisplay:
+    """Tests for pending orders display in bot commands."""
+
+    def test_status_shows_pending_orders(self, bot):
+        """Status should show pending orders section when orders exist."""
+        state = _sample_state()
+        state["pending_orders"] = {
+            "CAD/JPY": {
+                "units": 10000,
+                "limit_price": 108.500,
+                "tick_count": 1,
+            },
+        }
+        result = bot._handle_status(state)
+        assert "Pending" in result
+        assert "CAD/JPY" in result
+        assert "108.500" in result
+        assert "tick 1" in result
+
+    def test_status_hides_pending_when_empty(self, bot):
+        """Status should not show pending section when no orders."""
+        state = _sample_state()
+        state["pending_orders"] = {}
+        result = bot._handle_status(state)
+        assert "Pending" not in result
+
+    def test_positions_shows_pending_orders(self, bot):
+        """Positions should show pending orders after open positions."""
+        state = _sample_state()
+        state["pending_orders"] = {
+            "EUR/JPY": {
+                "units": 5000,
+                "limit_price": 163.200,
+                "tick_count": 0,
+            },
+        }
+        result = bot._handle_positions(state)
+        assert "Pending" in result
+        assert "EUR/JPY" in result
+        assert "163.200" in result
+
+    def test_positions_pending_only_no_positions(self, bot):
+        """Positions should show pending even with no open positions."""
+        state = _sample_state()
+        state["positions"] = []
+        state["pending_orders"] = {
+            "USD/JPY": {
+                "units": 3000,
+                "limit_price": 155.000,
+                "tick_count": 2,
+            },
+        }
+        result = bot._handle_positions(state)
+        assert "No open positions" not in result
+        assert "Pending" in result
+        assert "USD/JPY" in result

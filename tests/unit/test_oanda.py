@@ -177,9 +177,7 @@ class TestSubmitMarketOrder:
             }
         }
 
-        order = mock_broker.submit_market_order(
-            "USD/JPY", OrderSide.BUY, 10000
-        )
+        order = mock_broker.submit_market_order("USD/JPY", OrderSide.BUY, 10000)
         assert order is not None
         assert order.status == OrderStatus.FILLED
         assert order.avg_fill_price == 155.500
@@ -195,23 +193,17 @@ class TestSubmitMarketOrder:
             }
         }
 
-        order = mock_broker.submit_market_order(
-            "USD/JPY", OrderSide.SELL, 10000
-        )
+        order = mock_broker.submit_market_order("USD/JPY", OrderSide.SELL, 10000)
         assert order is not None
         assert order.status == OrderStatus.FILLED
         assert order.side == OrderSide.SELL
 
     def test_order_rejected(self, mock_broker):
         mock_broker.client.request.return_value = {
-            "orderRejectTransaction": {
-                "rejectReason": "INSUFFICIENT_MARGIN"
-            }
+            "orderRejectTransaction": {"rejectReason": "INSUFFICIENT_MARGIN"}
         }
 
-        order = mock_broker.submit_market_order(
-            "USD/JPY", OrderSide.BUY, 10000
-        )
+        order = mock_broker.submit_market_order("USD/JPY", OrderSide.BUY, 10000)
         assert order is not None
         assert order.status == OrderStatus.REJECTED
         assert "INSUFFICIENT_MARGIN" in order.reject_reason
@@ -299,3 +291,167 @@ class TestGetAllPositions:
         positions = mock_broker.get_all_positions()
         assert positions is not None
         assert len(positions) == 0
+
+
+class TestSubmitLimitOrder:
+    """Tests for limit order submission."""
+
+    def test_immediate_fill(self, mock_broker):
+        """Limit order that fills immediately (price at or above ask)."""
+        mock_broker.client.request.return_value = {
+            "orderFillTransaction": {
+                "id": "20001",
+                "orderID": "20000",
+                "price": "155.500",
+                "units": "10000",
+                "commission": "0.00",
+                "tradeOpened": {"tradeID": "T500"},
+            }
+        }
+
+        order = mock_broker.submit_limit_order(
+            "USD/JPY", OrderSide.BUY, 10000, price=155.500, stop_loss_price=154.0
+        )
+        assert order is not None
+        assert order.status == OrderStatus.FILLED
+        assert order.avg_fill_price == 155.500
+        assert order.trade_id == "T500"
+        assert order.side == OrderSide.BUY
+
+    def test_pending_order(self, mock_broker):
+        """Limit order that stays pending (bid below ask)."""
+        mock_broker.client.request.return_value = {
+            "orderCreateTransaction": {
+                "id": "20010",
+                "type": "LIMIT_ORDER",
+                "instrument": "USD_JPY",
+                "units": "10000",
+                "price": "155.400",
+                "timeInForce": "GTC",
+            }
+        }
+
+        order = mock_broker.submit_limit_order(
+            "USD/JPY", OrderSide.BUY, 10000, price=155.400
+        )
+        assert order is not None
+        assert order.status == OrderStatus.SUBMITTED
+        assert order.trade_id == "20010"  # OANDA order ID stored here
+
+    def test_rejection(self, mock_broker):
+        """Limit order rejected by broker."""
+        mock_broker.client.request.return_value = {
+            "orderRejectTransaction": {"rejectReason": "INSUFFICIENT_MARGIN"}
+        }
+
+        order = mock_broker.submit_limit_order(
+            "USD/JPY", OrderSide.BUY, 10000, price=155.500
+        )
+        assert order is not None
+        assert order.status == OrderStatus.REJECTED
+        assert "INSUFFICIENT_MARGIN" in order.reject_reason
+
+    def test_sell_side_negates_units(self, mock_broker):
+        """SELL limit should send negative units to OANDA."""
+        mock_broker.client.request.return_value = {
+            "orderCreateTransaction": {
+                "id": "20020",
+                "type": "LIMIT_ORDER",
+                "instrument": "USD_JPY",
+                "units": "-10000",
+                "price": "156.000",
+                "timeInForce": "GTC",
+            }
+        }
+
+        order = mock_broker.submit_limit_order(
+            "USD/JPY", OrderSide.SELL, 10000, price=156.000
+        )
+        assert order is not None
+        assert order.status == OrderStatus.SUBMITTED
+        assert order.side == OrderSide.SELL
+
+
+class TestGetPendingOrders:
+    """Tests for pending order queries."""
+
+    def test_returns_pending_orders(self, mock_broker):
+        """Should parse pending order list from OANDA."""
+        mock_broker.client.request.return_value = {
+            "orders": [
+                {
+                    "id": "30001",
+                    "type": "LIMIT",
+                    "instrument": "USD_JPY",
+                    "units": "10000",
+                    "price": "155.400",
+                    "timeInForce": "GTC",
+                    "stopLossOnFill": {"price": "154.000"},
+                    "createTime": "2026-02-01T12:00:00Z",
+                },
+                {
+                    "id": "30002",
+                    "type": "LIMIT",
+                    "instrument": "AUD_JPY",
+                    "units": "5000",
+                    "price": "98.500",
+                    "timeInForce": "GTC",
+                    "createTime": "2026-02-01T13:00:00Z",
+                },
+            ]
+        }
+
+        orders = mock_broker.get_pending_orders()
+        assert orders is not None
+        assert len(orders) == 2
+        assert orders[0]["order_id"] == "30001"
+        assert orders[0]["pair"] == "USD/JPY"
+        assert orders[0]["units"] == 10000
+        assert orders[0]["price"] == 155.400
+        assert orders[0]["stop_loss_price"] == 154.0
+        assert orders[1]["order_id"] == "30002"
+        assert orders[1]["pair"] == "AUD/JPY"
+        assert orders[1]["stop_loss_price"] is None  # No SL on this one
+
+    def test_returns_empty_list(self, mock_broker):
+        """Should return empty list when no pending orders."""
+        mock_broker.client.request.return_value = {"orders": []}
+
+        orders = mock_broker.get_pending_orders()
+        assert orders is not None
+        assert len(orders) == 0
+
+
+class TestCancelOrder:
+    """Tests for order cancellation."""
+
+    def test_cancel_success(self, mock_broker):
+        """Should return True on successful cancel."""
+        mock_broker.client.request.return_value = {
+            "orderCancelTransaction": {
+                "orderID": "30001",
+                "reason": "CLIENT_REQUEST",
+            }
+        }
+
+        result = mock_broker.cancel_order("30001")
+        assert result is True
+
+    def test_cancel_rejection(self, mock_broker):
+        """Should return False when cancel is rejected."""
+        mock_broker.client.request.return_value = {
+            "orderCancelRejectTransaction": {
+                "orderID": "30001",
+                "rejectReason": "ORDER_DOESNT_EXIST",
+            }
+        }
+
+        result = mock_broker.cancel_order("30001")
+        assert result is False
+
+    def test_cancel_unexpected_response(self, mock_broker):
+        """Should return False on unexpected response."""
+        mock_broker.client.request.return_value = {}
+
+        result = mock_broker.cancel_order("30001")
+        assert result is False

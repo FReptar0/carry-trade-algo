@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import pytest
 
-from src.broker.orders import OrderSide, OrderStatus, Order, Fill
+from src.broker.orders import OrderSide, OrderStatus, OrderType, Order, Fill
 from src.engine.runner import RunnerConfig, TradingRunner
 from src.validation.protocol import ProtocolStatus
 
@@ -142,13 +142,13 @@ class TestProcessPair:
         # Should not raise
         runner._process_pair("USD/JPY", now, in_blackout=False)
         # No orders should be placed
-        runner.broker.submit_market_order.assert_not_called()
+        runner.broker.submit_limit_order.assert_not_called()
 
     def test_skips_entry_during_blackout(self, runner):
         runner.broker.fetch_candles.return_value = None
         now = datetime(2026, 2, 1, 12, 0, tzinfo=UTC)
         runner._process_pair("USD/JPY", now, in_blackout=True)
-        runner.broker.submit_market_order.assert_not_called()
+        runner.broker.submit_limit_order.assert_not_called()
 
     def test_skips_entry_when_halted(self, runner):
         runner.circuit_breaker.trading_halted = True
@@ -156,7 +156,7 @@ class TestProcessPair:
         runner.broker.fetch_candles.return_value = None
         now = datetime(2026, 2, 1, 12, 0, tzinfo=UTC)
         runner._process_pair("USD/JPY", now, in_blackout=False)
-        runner.broker.submit_market_order.assert_not_called()
+        runner.broker.submit_limit_order.assert_not_called()
 
 
 class TestPositionManagement:
@@ -175,18 +175,24 @@ class TestPositionManagement:
         order = Order(
             pair="USD/JPY",
             side=OrderSide.BUY,
-            order_type=MagicMock(),
+            order_type=OrderType.LIMIT,
             quantity=10000,
             status=OrderStatus.FILLED,
             fills=[fill],
         )
-        runner.broker.submit_market_order.return_value = order
+        runner.broker.get_current_price.return_value = {
+            "bid": 155.500,
+            "ask": 155.520,
+            "mid": 155.510,
+        }
+        runner.broker.submit_limit_order.return_value = order
 
         now = datetime(2026, 2, 1, 12, 0, tzinfo=UTC)
         runner._open_position("USD/JPY", "Test entry", now)
 
         assert "USD/JPY" in runner._strategy_positions
         assert runner._trades_opened_today == 1
+        runner.broker.submit_limit_order.assert_called_once()
 
     def test_close_position(self, runner):
         # Set up an existing position
@@ -918,3 +924,394 @@ class TestFinancingTracking:
         pos = state["positions"][0]
         assert pos["financing"] == 0.0
         assert state["performance"]["total_financing"] == 0.0
+
+
+class TestPendingOrders:
+    """Tests for _check_pending_orders: fill promotion, stale cancellation, cleanup."""
+
+    def test_fill_promotion_when_order_disappears_and_trade_exists(self, runner):
+        """Pending order gone from broker + new trade → promoted to position."""
+        now = datetime(2026, 2, 1, 12, 0, tzinfo=UTC)
+
+        # Track a pending order
+        runner._pending_orders["USD/JPY"] = {
+            "order_id": "ORD100",
+            "pair": "USD/JPY",
+            "units": 10000,
+            "limit_price": 155.500,
+            "stop_loss_price": 153.500,
+            "reason": "golden cross",
+            "created_at": now - timedelta(hours=1),
+            "tick_count": 0,
+            "is_scale_in": False,
+            "current_atr": 0.65,
+        }
+
+        # Broker returns NO pending orders (order was filled)
+        runner.broker.get_pending_orders.return_value = []
+
+        # Broker shows a new open trade for USD/JPY
+        runner.broker.get_open_trades.return_value = [
+            {
+                "trade_id": "T500",
+                "pair": "USD/JPY",
+                "units": 10000,
+                "price": 155.500,
+                "financing": 0.0,
+            }
+        ]
+
+        runner._check_pending_orders(now)
+
+        # Pending order should be removed
+        assert "USD/JPY" not in runner._pending_orders
+        # Position should now exist
+        assert "USD/JPY" in runner._strategy_positions
+        pos = runner._strategy_positions["USD/JPY"]
+        assert pos["entry_price"] == 155.500
+        assert pos["units"] == 10000
+        assert pos["trade_id"] == "T500"
+        assert pos["stop_price"] == 153.500
+
+    def test_stale_order_cancelled_after_max_ticks(self, runner):
+        """Pending order exceeding max_pending_ticks is cancelled."""
+        now = datetime(2026, 2, 1, 14, 0, tzinfo=UTC)
+
+        runner._pending_orders["EUR/JPY"] = {
+            "order_id": "ORD200",
+            "pair": "EUR/JPY",
+            "units": 5000,
+            "limit_price": 162.000,
+            "stop_loss_price": 160.000,
+            "reason": "uptrend entry",
+            "created_at": now - timedelta(hours=2),
+            "tick_count": 1,  # Already 1 tick old
+            "is_scale_in": False,
+            "current_atr": 0.70,
+        }
+
+        # Broker still shows the order as pending
+        runner.broker.get_pending_orders.return_value = [
+            {
+                "order_id": "ORD200",
+                "pair": "EUR/JPY",
+                "units": 5000,
+                "price": 162.000,
+                "order_type": "LIMIT",
+                "time_in_force": "GTC",
+                "stop_loss_price": 160.000,
+                "create_time": "2026-02-01T12:00:00Z",
+            }
+        ]
+        runner.broker.get_open_trades.return_value = []
+        runner.broker.cancel_order.return_value = True
+
+        # max_pending_ticks default is 2, tick_count will become 2 → cancel
+        runner._check_pending_orders(now)
+
+        # Order should be cancelled
+        runner.broker.cancel_order.assert_called_once_with("ORD200")
+        # Pending tracking should be cleaned up
+        assert "EUR/JPY" not in runner._pending_orders
+        # No position should exist
+        assert "EUR/JPY" not in runner._strategy_positions
+
+    def test_broker_side_cleanup_when_order_gone_no_trade(self, runner):
+        """Order gone from broker with no new trade → cleaned up."""
+        now = datetime(2026, 2, 1, 14, 0, tzinfo=UTC)
+
+        runner._pending_orders["GBP/JPY"] = {
+            "order_id": "ORD300",
+            "pair": "GBP/JPY",
+            "units": 8000,
+            "limit_price": 212.000,
+            "stop_loss_price": 210.000,
+            "reason": "strong uptrend",
+            "created_at": now - timedelta(hours=1),
+            "tick_count": 0,
+            "is_scale_in": False,
+            "current_atr": 0.80,
+        }
+
+        # Broker has no pending orders and no trades for GBP/JPY
+        runner.broker.get_pending_orders.return_value = []
+        runner.broker.get_open_trades.return_value = []
+
+        runner._check_pending_orders(now)
+
+        # Should be removed from tracking
+        assert "GBP/JPY" not in runner._pending_orders
+        # No position created
+        assert "GBP/JPY" not in runner._strategy_positions
+
+    def test_pending_order_still_waiting_increments_tick(self, runner):
+        """Order still pending and under limit → tick_count incremented, not cancelled."""
+        now = datetime(2026, 2, 1, 13, 0, tzinfo=UTC)
+
+        runner._pending_orders["NZD/JPY"] = {
+            "order_id": "ORD400",
+            "pair": "NZD/JPY",
+            "units": 5000,
+            "limit_price": 93.500,
+            "stop_loss_price": 91.500,
+            "reason": "entry",
+            "created_at": now - timedelta(hours=1),
+            "tick_count": 0,
+            "is_scale_in": False,
+            "current_atr": 0.50,
+        }
+
+        runner.broker.get_pending_orders.return_value = [
+            {
+                "order_id": "ORD400",
+                "pair": "NZD/JPY",
+                "units": 5000,
+                "price": 93.500,
+                "order_type": "LIMIT",
+                "time_in_force": "GTC",
+                "stop_loss_price": 91.500,
+                "create_time": "2026-02-01T12:00:00Z",
+            }
+        ]
+        runner.broker.get_open_trades.return_value = []
+
+        runner._check_pending_orders(now)
+
+        # Still in pending
+        assert "NZD/JPY" in runner._pending_orders
+        # Tick count incremented from 0 → 1
+        assert runner._pending_orders["NZD/JPY"]["tick_count"] == 1
+        # No cancel call
+        runner.broker.cancel_order.assert_not_called()
+
+    def test_no_action_when_no_pending_orders(self, runner):
+        """No pending orders → no broker calls."""
+        now = datetime(2026, 2, 1, 12, 0, tzinfo=UTC)
+        runner._pending_orders = {}
+
+        runner._check_pending_orders(now)
+
+        runner.broker.get_pending_orders.assert_not_called()
+        runner.broker.get_open_trades.assert_not_called()
+
+
+class TestPromoteFilledOrder:
+    """Tests for _promote_filled_order: new entry and scale-in merge."""
+
+    def test_new_entry_creates_position(self, runner):
+        """New entry promotion creates position dict with correct fields."""
+        fill = Fill(
+            fill_id="F100",
+            order_id="ORD100",
+            timestamp=datetime.now(),
+            price=155.500,
+            quantity=10000,
+            commission=0,
+            slippage=0,
+        )
+        order = Order(
+            pair="USD/JPY",
+            side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            quantity=10000,
+            status=OrderStatus.FILLED,
+            fills=[fill],
+            trade_id="T500",
+        )
+
+        now = datetime(2026, 2, 1, 12, 0, tzinfo=UTC)
+        runner._promote_filled_order(
+            pair="USD/JPY",
+            order=order,
+            units=10000,
+            stop_loss_price=153.500,
+            current_atr=0.65,
+            reason="golden cross",
+            now=now,
+        )
+
+        assert "USD/JPY" in runner._strategy_positions
+        pos = runner._strategy_positions["USD/JPY"]
+        assert pos["entry_price"] == 155.500
+        assert pos["units"] == 10000
+        assert pos["trade_id"] == "T500"
+        assert pos["stop_price"] == 153.500
+        assert pos["tranche_count"] == 1
+        assert pos["financing"] == 0.0
+        assert pos["high_water_mark"] == 155.500
+        assert runner._trades_opened_today == 1
+
+    def test_scale_in_merge_updates_position(self, runner):
+        """Scale-in fill merges into existing position with weighted avg price."""
+        # Set up existing position: 5000 units @ 155.000
+        runner._strategy_positions["USD/JPY"] = {
+            "entry_price": 155.000,
+            "entry_time": datetime(2026, 2, 1, 10, 0, tzinfo=UTC),
+            "units": 5000,
+            "tranche_count": 1,
+            "levels_taken": 0,
+            "trade_id": "T400",
+            "stop_price": 153.000,
+            "high_water_mark": 155.500,
+            "low_water_mark": 155.000,
+            "financing": 2.50,
+        }
+
+        fill = Fill(
+            fill_id="F200",
+            order_id="ORD200",
+            timestamp=datetime.now(),
+            price=155.800,
+            quantity=5000,
+            commission=0,
+            slippage=0,
+        )
+        order = Order(
+            pair="USD/JPY",
+            side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            quantity=5000,
+            status=OrderStatus.FILLED,
+            fills=[fill],
+            trade_id="T600",
+        )
+
+        now = datetime(2026, 2, 1, 14, 0, tzinfo=UTC)
+        runner._promote_filled_order(
+            pair="USD/JPY",
+            order=order,
+            units=5000,
+            stop_loss_price=153.000,
+            current_atr=0.65,
+            reason="scale-in",
+            now=now,
+            is_scale_in=True,
+        )
+
+        pos = runner._strategy_positions["USD/JPY"]
+        # Weighted average: (155.000 * 5000 + 155.800 * 5000) / 10000 = 155.400
+        assert pos["entry_price"] == pytest.approx(155.400)
+        assert pos["units"] == 10000
+        assert pos["tranche_count"] == 2
+        # trade_ids should contain both T400 and T600
+        assert "T400" in pos["trade_ids"]
+        assert "T600" in pos["trade_ids"]
+
+    def test_scale_in_no_existing_position_creates_new(self, runner):
+        """Scale-in when no position exists falls back to creating a new one."""
+        fill = Fill(
+            fill_id="F300",
+            order_id="ORD300",
+            timestamp=datetime.now(),
+            price=155.500,
+            quantity=5000,
+            commission=0,
+            slippage=0,
+        )
+        order = Order(
+            pair="AUD/JPY",
+            side=OrderSide.BUY,
+            order_type=OrderType.LIMIT,
+            quantity=5000,
+            status=OrderStatus.FILLED,
+            fills=[fill],
+            trade_id="T700",
+        )
+
+        now = datetime(2026, 2, 1, 14, 0, tzinfo=UTC)
+        runner._promote_filled_order(
+            pair="AUD/JPY",
+            order=order,
+            units=5000,
+            stop_loss_price=97.000,
+            current_atr=0.50,
+            reason="scale-in",
+            now=now,
+            is_scale_in=True,
+        )
+
+        # Should create a new position (fallback from scale-in)
+        assert "AUD/JPY" in runner._strategy_positions
+        assert runner._strategy_positions["AUD/JPY"]["units"] == 5000
+        assert runner._trades_opened_today == 1
+
+
+class TestPendingOrderGuard:
+    """Tests for _process_pair pending order guard."""
+
+    def test_skips_entry_when_limit_order_pending(self, runner):
+        """When a limit order is already pending for a pair, skip entry."""
+        # Set up enough candle data for strategy to generate signals
+        n_bars = 300
+        import numpy as np
+
+        rng = np.random.default_rng(42)
+        closes = 155.0 + np.cumsum(rng.normal(0.05, 0.1, n_bars))
+        df = pd.DataFrame(
+            {
+                "timestamp": pd.date_range("2025-10-01", periods=n_bars, freq="h"),
+                "open": closes - 0.1,
+                "high": closes + 0.3,
+                "low": closes - 0.3,
+                "close": closes,
+                "volume": [1000] * n_bars,
+            }
+        )
+        runner.broker.fetch_candles.return_value = df
+
+        # Mark a pending order for this pair
+        runner._pending_orders["USD/JPY"] = {
+            "order_id": "ORD999",
+            "pair": "USD/JPY",
+            "units": 10000,
+            "limit_price": 155.500,
+            "stop_loss_price": 153.500,
+            "reason": "entry",
+            "created_at": datetime.now(UTC),
+            "tick_count": 0,
+            "is_scale_in": False,
+            "current_atr": 0.65,
+        }
+
+        now = datetime(2026, 2, 1, 12, 0, tzinfo=UTC)
+        runner._process_pair("USD/JPY", now, in_blackout=False)
+
+        # Even if strategy generates LONG, no new limit order should be placed
+        runner.broker.submit_limit_order.assert_not_called()
+        runner.broker.get_current_price.assert_not_called()
+
+
+class TestSystemStatePendingOrders:
+    """Tests for get_system_state() pending_orders inclusion."""
+
+    def test_includes_pending_orders(self, runner):
+        """get_system_state should include pending_orders dict."""
+        now = datetime(2026, 2, 1, 12, 0, tzinfo=UTC)
+        runner._pending_orders["CAD/JPY"] = {
+            "order_id": "ORD500",
+            "pair": "CAD/JPY",
+            "units": 5000,
+            "limit_price": 108.500,
+            "stop_loss_price": 106.500,
+            "reason": "entry",
+            "created_at": now,
+            "tick_count": 0,
+            "is_scale_in": False,
+            "current_atr": 0.55,
+        }
+
+        state = runner.get_system_state()
+
+        assert "pending_orders" in state
+        assert "CAD/JPY" in state["pending_orders"]
+        assert state["pending_orders"]["CAD/JPY"]["order_id"] == "ORD500"
+        assert state["pending_orders"]["CAD/JPY"]["units"] == 5000
+
+    def test_empty_pending_orders(self, runner):
+        """Empty pending_orders when none exist."""
+        runner._pending_orders = {}
+
+        state = runner.get_system_state()
+
+        assert "pending_orders" in state
+        assert state["pending_orders"] == {}

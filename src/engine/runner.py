@@ -14,12 +14,14 @@ Tick workflow (every hour):
    blocks new entries and scale-in but manages existing positions)
 4. Fetch latest candles from OANDA for each pair
 5. Update correlation monitor
+5b. Sync financing from broker
+5c. Check pending limit orders (fill promotion / stale cancellation)
 6. Check economic calendar blackout (skip new entries if active)
 6b. Check ExitManager for existing positions (time, regime, support,
     trend reversal, profit-scaled trailing — closes if triggered)
 7. Run V3 strategy on candle data
 8. Run signal filter (bandit gate)
-9. Execute signal via OANDA with dynamic sizing
+9. Place limit order at bid (entries and scale-in)
 10. Check scale-in/scale-out for existing positions
 11. Update performance monitor
 12. Check circuit breakers
@@ -49,7 +51,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from src.broker.oanda import OandaBroker
-from src.broker.orders import OrderSide
+from src.broker.orders import OrderSide, OrderStatus
 from src.engine.market_hours import ForexMarketHours
 from src.data.cross_asset import CrossAssetFetcher
 from src.ml.bandit import SignalBandit
@@ -121,6 +123,7 @@ class RunnerConfig:
     enable_signal_filter: bool = True
     enable_dynamic_sizing: bool = True
     enable_scaling: bool = True
+    max_pending_ticks: int = 2  # Cancel unfilled limit orders after N ticks (~2 hours)
 
 
 class TradingRunner:
@@ -219,6 +222,9 @@ class TradingRunner:
         # Track open positions per pair (from strategy signals)
         self._strategy_positions: dict[str, dict] = {}
 
+        # Track pending limit orders per pair (not yet filled)
+        self._pending_orders: dict[str, dict] = {}
+
     def _init_alert_manager(self) -> Optional[AlertManager]:
         """Initialize AlertManager if Telegram credentials exist."""
         token = self.config.telegram_bot_token or os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -307,6 +313,7 @@ class TradingRunner:
             "account": acct,
             "protocol": protocol_info,
             "positions": positions,
+            "pending_orders": dict(self._pending_orders),
             "performance": perf,
             "last_tick": self._last_tick_time,
             "market_open": ForexMarketHours.is_market_open(datetime.now(UTC)),
@@ -621,6 +628,12 @@ class TradingRunner:
                 if bp is not None:
                     pos["financing"] = bp.get("financing", 0.0)
 
+        # 5c. Check pending limit orders (fill promotion / stale cancellation)
+        try:
+            self._check_pending_orders(now)
+        except Exception as e:
+            logger.error("Pending order check failed: %s", e)
+
         # 6. Process each pair
         for pair in self.config.pairs:
             try:
@@ -809,6 +822,9 @@ class TradingRunner:
         # Determine if this pair has an open position
         has_position = pair in self._strategy_positions
 
+        # Skip entry if there's already a pending limit order for this pair
+        has_pending = pair in self._pending_orders
+
         # Phase 3 hardening: Run ExitManager on existing positions
         # (time-based, regime-change, support-break, profit-scaled trailing)
         # This runs BEFORE V3 signal check — if ExitManager closes, we're done.
@@ -830,7 +846,14 @@ class TradingRunner:
                 self._check_scaling(pair, df)
 
         if last_signal.signal == Signal.LONG and not has_position:
-            # New entry signal
+            # New entry signal — skip if a limit order is already pending
+            if has_pending:
+                logger.debug(
+                    "Skipping entry for %s (limit order already pending)",
+                    pair,
+                )
+                return
+
             if self.protocol.status == ProtocolStatus.DEGRADED:
                 logger.info(
                     "Skipping entry for %s (DEGRADED mode — no new entries)",
@@ -876,7 +899,13 @@ class TradingRunner:
         df: Optional[pd.DataFrame] = None,
         equity: float = 0.0,
     ) -> None:
-        """Open a new position via OANDA with a broker-side stop-loss.
+        """Place a limit order at bid to open a new position.
+
+        Uses limit orders at the current bid price instead of market
+        orders to save spread cost (~1-2 pips per entry on JPY pairs).
+        If the limit fills immediately (bid >= ask edge case), the
+        position is promoted to _strategy_positions right away. Otherwise
+        it's tracked in _pending_orders and checked each tick.
 
         Args:
             pair: Currency pair.
@@ -932,34 +961,168 @@ class TradingRunner:
             units = self.config.position_size_units
 
         # Calculate broker-side stop-loss price (3x ATR below entry)
-        # Uses current close as proxy — the few pips of slippage are
-        # negligible vs 3x ATR stop width (~3-4% on JPY pairs).
         atr_stop_mult = self.strategy.config.atr_stop_mult
         stop_loss_price = None
         if current_close > 0 and current_atr > 0:
             stop_loss_price = round(current_close - (current_atr * atr_stop_mult), 3)
 
-        order = self.broker.submit_market_order(
+        # Get current bid price for the limit order
+        price_data = self.broker.get_current_price(pair)
+        if price_data is None:
+            logger.error("Cannot get bid price for %s, skipping entry", pair)
+            return
+        bid_price = price_data["bid"]
+
+        order = self.broker.submit_limit_order(
             pair=pair,
             side=OrderSide.BUY,
             units=units,
+            price=bid_price,
             stop_loss_price=stop_loss_price,
         )
 
-        if order is None or order.avg_fill_price is None:
-            logger.error("Failed to open position for %s", pair)
+        if order is None:
+            logger.error("Failed to submit limit order for %s", pair)
             return
 
+        if order.status == OrderStatus.REJECTED:
+            logger.error(
+                "Limit order rejected for %s: %s",
+                pair,
+                order.reject_reason,
+            )
+            return
+
+        # Case 1: Immediate fill (limit at or above ask)
+        if order.status == OrderStatus.FILLED and order.avg_fill_price is not None:
+            self._promote_filled_order(
+                pair=pair,
+                order=order,
+                units=units,
+                stop_loss_price=stop_loss_price,
+                current_atr=current_atr,
+                reason=reason,
+                now=now,
+                df=df,
+            )
+            return
+
+        # Case 2: Order is pending — track it for later promotion
+        if order.status == OrderStatus.SUBMITTED:
+            self._pending_orders[pair] = {
+                "order_id": order.trade_id,  # OANDA order ID stored here
+                "pair": pair,
+                "units": units,
+                "limit_price": bid_price,
+                "stop_loss_price": stop_loss_price,
+                "reason": reason,
+                "created_at": now,
+                "tick_count": 0,
+                "is_scale_in": False,
+                "current_atr": current_atr,
+            }
+            logger.info(
+                "Limit order pending: %s %d units @ %.3f (stop=%.3f) — %s",
+                pair,
+                units,
+                bid_price,
+                stop_loss_price or 0.0,
+                reason,
+            )
+            if self.alert_manager:
+                self.alert_manager.send(
+                    "INFO",
+                    "Limit Order Placed",
+                    f"{pair} BUY {units} units @ {bid_price:.3f} "
+                    f"(stop={stop_loss_price:.3f}) — {reason}",
+                )
+            return
+
+        logger.warning(
+            "Unexpected order status for %s: %s",
+            pair,
+            order.status.name if order.status else "None",
+        )
+
+    def _promote_filled_order(
+        self,
+        pair: str,
+        order,
+        units: int,
+        stop_loss_price: Optional[float],
+        current_atr: float,
+        reason: str,
+        now: datetime,
+        df: Optional[pd.DataFrame] = None,
+        is_scale_in: bool = False,
+    ) -> None:
+        """Promote a filled limit order to a full strategy position.
+
+        Shared by both immediate fills (from _open_position) and
+        deferred fills (from _check_pending_orders). Handles
+        position tracking, ExitManager init, trade persistence,
+        and alerts.
+
+        Args:
+            pair: Currency pair.
+            order: Filled Order object with avg_fill_price and trade_id.
+            units: Number of units.
+            stop_loss_price: Broker-side stop price (if any).
+            current_atr: ATR at time of order placement.
+            reason: Entry reason.
+            now: Current time.
+            df: Candle data (for ExitManager regime detection).
+            is_scale_in: Whether this fill is for a scale-in tranche.
+        """
+        fill_price = order.avg_fill_price
+
+        if is_scale_in:
+            # Scale-in: merge into existing position
+            position = self._strategy_positions.get(pair)
+            if position is None:
+                logger.warning(
+                    "Scale-in fill for %s but no position exists, treating as new",
+                    pair,
+                )
+                is_scale_in = False
+            else:
+                total_units = position["units"] + units
+                position["entry_price"] = (
+                    position["entry_price"] * position["units"] + fill_price * units
+                ) / total_units
+                position["units"] = total_units
+                position["tranche_count"] = position.get("tranche_count", 1) + 1
+
+                trade_ids = position.get("trade_ids", [])
+                if position.get("trade_id") and position["trade_id"] not in trade_ids:
+                    trade_ids.append(position["trade_id"])
+                if order.trade_id:
+                    trade_ids.append(order.trade_id)
+                position["trade_ids"] = trade_ids
+
+                logger.info(
+                    "Scale-in limit filled %s: +%d units @ %.5f "
+                    "(stop=%.3f, trade_id=%s, total %d)",
+                    pair,
+                    units,
+                    fill_price,
+                    stop_loss_price or 0.0,
+                    order.trade_id or "N/A",
+                    total_units,
+                )
+                return
+
+        # New position (entry or fallback from scale-in)
         self._strategy_positions[pair] = {
-            "entry_price": order.avg_fill_price,
+            "entry_price": fill_price,
             "entry_time": now,
             "units": units,
             "tranche_count": 1,
             "levels_taken": 0,
             "trade_id": order.trade_id,
             "stop_price": stop_loss_price,
-            "high_water_mark": order.avg_fill_price,
-            "low_water_mark": order.avg_fill_price,
+            "high_water_mark": fill_price,
+            "low_water_mark": fill_price,
             "financing": 0.0,
         }
         self._trades_opened_today += 1
@@ -967,14 +1130,14 @@ class TradingRunner:
         # Initialize ExitManager for this pair
         em = self._get_or_create_exit_manager(pair)
         regime = self._detect_regime_safe(df)
-        em.initialize_stop(order.avg_fill_price, current_atr, regime)
+        em.initialize_stop(fill_price, current_atr, regime)
 
         self.store.save_trade(
             {
                 "timestamp": now.isoformat(),
                 "pair": pair,
                 "side": "BUY",
-                "entry_price": order.avg_fill_price,
+                "entry_price": fill_price,
                 "quantity": float(units),
                 "status": "open",
                 "metadata": {
@@ -985,13 +1148,12 @@ class TradingRunner:
             }
         )
 
-        # Alert on trade
         if self.alert_manager:
             self.alert_manager.send(
                 "INFO",
                 "Trade Opened",
                 f"{pair} LONG {units} units @ "
-                f"{order.avg_fill_price:.5f} "
+                f"{fill_price:.5f} "
                 f"(stop={stop_loss_price:.3f}) — {reason}",
             )
 
@@ -1000,11 +1162,157 @@ class TradingRunner:
             "Opened %s %d units @ %.5f (stop=%.3f, trade_id=%s) — %s",
             pair,
             units,
-            order.avg_fill_price,
+            fill_price,
             stop_loss_price or 0.0,
             order.trade_id or "N/A",
             reason,
         )
+
+    def _check_pending_orders(self, now: datetime) -> None:
+        """Check pending limit orders for fills or expiration.
+
+        For each pending order:
+        1. Query OANDA for its current state (filled, pending, cancelled)
+        2. If filled: promote to _strategy_positions via _promote_filled_order
+        3. If still pending: increment tick_count, cancel if stale
+        4. If already cancelled/expired on OANDA: clean up
+
+        Args:
+            now: Current UTC time.
+        """
+        if not self._pending_orders:
+            return
+
+        # Fetch all pending orders from OANDA in one call
+        broker_pending = self.broker.get_pending_orders()
+        broker_order_ids = set()
+        if broker_pending:
+            broker_order_ids = {o["order_id"] for o in broker_pending}
+
+        # Also check open trades to detect fills
+        open_trades = self.broker.get_open_trades()
+        trade_pairs = set()
+        trade_by_pair: dict[str, dict] = {}
+        if open_trades:
+            for t in open_trades:
+                pair = t["pair"]
+                trade_pairs.add(pair)
+                # Keep the most recent trade per pair
+                if pair not in trade_by_pair:
+                    trade_by_pair[pair] = t
+
+        pairs_to_remove = []
+
+        for pair, pending in list(self._pending_orders.items()):
+            order_id = pending.get("order_id", "")
+
+            # Check if the order is still pending on OANDA
+            if order_id in broker_order_ids:
+                # Order still pending — check for staleness
+                pending["tick_count"] = pending.get("tick_count", 0) + 1
+
+                if pending["tick_count"] >= self.config.max_pending_ticks:
+                    # Stale — cancel it
+                    success = self.broker.cancel_order(order_id)
+                    if success:
+                        logger.info(
+                            "Cancelled stale limit order for %s "
+                            "(order_id=%s, ticks=%d)",
+                            pair,
+                            order_id,
+                            pending["tick_count"],
+                        )
+                        if self.alert_manager:
+                            self.alert_manager.send(
+                                "INFO",
+                                "Limit Order Expired",
+                                f"{pair} limit @ {pending['limit_price']:.3f} "
+                                f"cancelled after {pending['tick_count']} ticks",
+                            )
+                    else:
+                        logger.warning(
+                            "Failed to cancel stale order %s for %s",
+                            order_id,
+                            pair,
+                        )
+                    pairs_to_remove.append(pair)
+                else:
+                    logger.debug(
+                        "Limit order for %s still pending (tick %d/%d)",
+                        pair,
+                        pending["tick_count"],
+                        self.config.max_pending_ticks,
+                    )
+                continue
+
+            # Order not in pending list — either filled or cancelled
+            # Check if a position now exists for this pair (meaning it filled)
+            if pair in trade_pairs and pair not in self._strategy_positions:
+                # Order was filled by OANDA — promote to position
+                trade = trade_by_pair.get(pair)
+                if trade:
+                    from src.broker.orders import Fill, Order, OrderType
+
+                    filled_order = Order(
+                        pair=pair,
+                        side=OrderSide.BUY,
+                        order_type=OrderType.LIMIT,
+                        quantity=float(pending["units"]),
+                        limit_price=pending["limit_price"],
+                        status=OrderStatus.FILLED,
+                        filled_at=now,
+                        trade_id=trade["trade_id"],
+                        fills=[
+                            Fill(
+                                fill_id=trade["trade_id"],
+                                order_id=order_id,
+                                timestamp=now,
+                                price=trade["price"],
+                                quantity=float(abs(trade["units"])),
+                                commission=0.0,
+                                slippage=0.0,
+                            )
+                        ],
+                    )
+
+                    logger.info(
+                        "Limit order filled for %s: %d units @ %.5f (trade_id=%s)",
+                        pair,
+                        abs(trade["units"]),
+                        trade["price"],
+                        trade["trade_id"],
+                    )
+
+                    # Get cached candle data for ExitManager regime detection
+                    df = self._candle_cache.get(pair)
+
+                    self._promote_filled_order(
+                        pair=pair,
+                        order=filled_order,
+                        units=pending["units"],
+                        stop_loss_price=pending.get("stop_loss_price"),
+                        current_atr=pending.get("current_atr", 0.5),
+                        reason=pending.get("reason", "limit fill"),
+                        now=now,
+                        df=df,
+                        is_scale_in=pending.get("is_scale_in", False),
+                    )
+                    pairs_to_remove.append(pair)
+                    continue
+
+            # Order not pending and no new trade — it was cancelled or
+            # expired on the broker side
+            logger.info(
+                "Pending order for %s (order_id=%s) no longer on broker, "
+                "removing from tracking",
+                pair,
+                order_id,
+            )
+            pairs_to_remove.append(pair)
+
+        # Clean up processed pending orders
+        for pair in pairs_to_remove:
+            self._pending_orders.pop(pair, None)
 
     def _close_position(self, pair: str, reason: str, now: datetime) -> None:
         """Close an existing position via OANDA.
@@ -1286,20 +1594,49 @@ class TradingRunner:
         if scale_in_allowed and self.scale_manager.should_add(
             position, current_price, current_atr
         ):
+            # Skip if there's already a pending scale-in order for this pair
+            if pair in self._pending_orders:
+                logger.debug(
+                    "Skipping scale-in for %s (limit order already pending)",
+                    pair,
+                )
+                return
+
             add_units = self.scale_manager.tranche_units(position["units"])
 
             # Calculate broker-side stop for the new tranche
             atr_stop_mult = self.strategy.config.atr_stop_mult
             scale_stop = round(current_price - (current_atr * atr_stop_mult), 3)
 
-            order = self.broker.submit_market_order(
+            # Get current bid for limit order
+            price_data = self.broker.get_current_price(pair)
+            if price_data is None:
+                logger.warning("Cannot get bid for %s scale-in", pair)
+                return
+            bid_price = price_data["bid"]
+
+            order = self.broker.submit_limit_order(
                 pair=pair,
                 side=OrderSide.BUY,
                 units=add_units,
+                price=bid_price,
                 stop_loss_price=scale_stop,
             )
-            if order and order.avg_fill_price:
-                # Update average entry price
+
+            if order is None:
+                logger.error("Failed to submit scale-in limit for %s", pair)
+                return
+
+            if order.status == OrderStatus.REJECTED:
+                logger.error(
+                    "Scale-in limit rejected for %s: %s",
+                    pair,
+                    order.reject_reason,
+                )
+                return
+
+            # Immediate fill
+            if order.status == OrderStatus.FILLED and order.avg_fill_price:
                 total_units = position["units"] + add_units
                 position["entry_price"] = (
                     position["entry_price"] * position["units"]
@@ -1308,8 +1645,6 @@ class TradingRunner:
                 position["units"] = total_units
                 position["tranche_count"] = position.get("tranche_count", 1) + 1
 
-                # Track all trade_ids for the position; the first
-                # remains the "primary" used by _update_stop_losses.
                 trade_ids = position.get("trade_ids", [])
                 if position.get("trade_id") and position["trade_id"] not in trade_ids:
                     trade_ids.append(position["trade_id"])
@@ -1318,13 +1653,36 @@ class TradingRunner:
                 position["trade_ids"] = trade_ids
 
                 logger.info(
-                    "Scaled in %s: +%d units @ %.5f (stop=%.3f, trade_id=%s, total %d)",
+                    "Scale-in limit filled %s: +%d units @ %.5f "
+                    "(stop=%.3f, trade_id=%s, total %d)",
                     pair,
                     add_units,
                     order.avg_fill_price,
                     scale_stop,
                     order.trade_id or "N/A",
                     total_units,
+                )
+
+            # Pending — track for later promotion
+            elif order.status == OrderStatus.SUBMITTED:
+                self._pending_orders[pair] = {
+                    "order_id": order.trade_id,
+                    "pair": pair,
+                    "units": add_units,
+                    "limit_price": bid_price,
+                    "stop_loss_price": scale_stop,
+                    "reason": "scale-in",
+                    "created_at": datetime.now(UTC),
+                    "tick_count": 0,
+                    "is_scale_in": True,
+                    "current_atr": current_atr,
+                }
+                logger.info(
+                    "Scale-in limit pending %s: +%d units @ %.3f (stop=%.3f)",
+                    pair,
+                    add_units,
+                    bid_price,
+                    scale_stop,
                 )
 
         # Check scale-out (partial profit)

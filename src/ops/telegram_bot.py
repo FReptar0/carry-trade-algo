@@ -194,74 +194,94 @@ class TelegramCommandBot:
         Returns:
             Formatted status message.
         """
-        lines = ["*CARRY TRADE STATUS*", ""]
+        lines: list[str] = []
 
-        # Account
+        # Header with equity front and center
         acct = state.get("account", {})
         equity = acct.get("equity", 0)
         balance = acct.get("balance", 0)
         unrealized = acct.get("unrealized_pnl", 0)
-        lines.append("*Account*")
-        lines.append(f"  Equity: ${equity:,.2f}")
-        lines.append(f"  Balance: ${balance:,.2f}")
-        lines.append(f"  Unrealized: ${unrealized:+,.2f}")
-        lines.append("")
+        unr_emoji = "\U0001f7e2" if unrealized >= 0 else "\U0001f534"
+        lines.append(f"\U0001f4b0 *Equity: ${equity:,.2f}*")
+        lines.append(f"Balance ${balance:,.2f} | Open {unr_emoji} ${unrealized:+,.2f}")
 
-        # Protocol
+        # Protocol bar
         proto = state.get("protocol", {})
-        lines.append("*Protocol*")
-        lines.append(
-            f"  Day {proto.get('day', '?')}/{proto.get('duration', 30)}"
-            f" — {proto.get('status', '?').upper()}"
-        )
+        status = proto.get("status", "?").upper()
+        day = proto.get("day", "?")
+        duration = proto.get("duration", 30)
         dd = proto.get("drawdown", 0)
-        lines.append(f"  Drawdown: {dd:.2%}")
+        status_emoji = (
+            "\U0001f6a8"
+            if status == "DEGRADED"
+            else "\u2705"
+            if status == "RUNNING"
+            else "\u26a0\ufe0f"
+        )
+        lines.append(f"{status_emoji} Day {day}/{duration} {status} | DD {dd:.1%}")
         if proto.get("degraded_reason"):
-            lines.append(f"  Degraded: {proto['degraded_reason']}")
+            lines.append(f"   \u26a0\ufe0f {proto['degraded_reason']}")
         lines.append("")
 
-        # Positions summary
+        # Positions — compact view
         positions = state.get("positions", [])
         total_pnl = sum(p.get("unrealized_pnl", 0) for p in positions)
         total_fin = sum(p.get("financing", 0) for p in positions)
-        lines.append(f"*Positions ({len(positions)})*  PnL: ${total_pnl:+,.2f}")
+        pnl_emoji = "\U0001f7e2" if total_pnl >= 0 else "\U0001f534"
+        header = (
+            f"\U0001f4ca *{len(positions)} Positions* {pnl_emoji} ${total_pnl:+,.2f}"
+        )
         if total_fin != 0:
-            lines.append(f"  Carry income: ${total_fin:+,.2f}")
+            header += f" | Carry ${total_fin:+,.2f}"
+        lines.append(header)
         for pos in positions:
             pair = pos.get("pair", "???")
-            units = pos.get("units", 0)
             pnl = pos.get("unrealized_pnl", 0)
             entry = pos.get("entry_price", 0)
-            stop = pos.get("stop_price")
             current = pos.get("current_price", 0)
+            stop = pos.get("stop_price")
+            units = pos.get("units", 0)
 
-            stop_str = f"SL={stop:.3f}" if stop else "no SL"
             profit_pct = (
                 ((current - entry) / entry * 100) if entry > 0 and current > 0 else 0
             )
-            emoji = "+" if pnl >= 0 else ""
-            lines.append(f"  {pair}: {units:,}u @ {entry:.3f}")
+            dot = "\U0001f7e2" if pnl >= 0 else "\U0001f534"
+            stop_str = f"SL {stop:.3f}" if stop else "no SL"
             lines.append(
-                f"    Now {current:.3f} ({emoji}{profit_pct:.2f}%)"
-                f"  ${pnl:+,.2f}  {stop_str}"
+                f"{dot} {pair} {units:,}u ${pnl:+,.2f} ({profit_pct:+.1f}%) {stop_str}"
             )
+
+        # Pending orders (if any)
+        pending = state.get("pending_orders", {})
+        if pending:
+            lines.append("")
+            lines.append(
+                f"\u23f3 *{len(pending)} Pending Order"
+                f"{'s' if len(pending) != 1 else ''}*"
+            )
+            for pair, p in pending.items():
+                tick_count = p.get("tick_count", 0)
+                lines.append(
+                    f"  {pair} {p.get('units', 0):,}u "
+                    f"@ {p.get('limit_price', 0):.3f} "
+                    f"(tick {tick_count})"
+                )
+
         lines.append("")
 
-        # Performance
+        # Performance row
         perf = state.get("performance", {})
         daily_pnl = perf.get("daily_pnl", 0)
-        hwm = perf.get("high_water_mark", 0)
+        daily_emoji = "\U0001f7e2" if daily_pnl >= 0 else "\U0001f534"
         total_financing = perf.get("total_financing", 0)
-        lines.append("*Performance*")
-        lines.append(f"  Daily PnL: ${daily_pnl:+,.2f}")
-        lines.append(f"  High Water: ${hwm:,.2f}")
-        if total_financing != 0:
-            lines.append(f"  Total Carry: ${total_financing:+,.2f}")
-
         uptime = datetime.now(UTC) - self._start_time
         hours = int(uptime.total_seconds() // 3600)
         minutes = int((uptime.total_seconds() % 3600) // 60)
-        lines.append(f"  Uptime: {hours}h {minutes}m")
+        perf_parts = [f"Today {daily_emoji} ${daily_pnl:+,.2f}"]
+        if total_financing != 0:
+            perf_parts.append(f"Carry ${total_financing:+,.2f}")
+        perf_parts.append(f"Up {hours}h{minutes}m")
+        lines.append(" | ".join(perf_parts))
 
         return _escape_markdown("\n".join(lines))
 
@@ -274,35 +294,54 @@ class TelegramCommandBot:
         Returns:
             Formatted health message.
         """
-        lines = ["*HEALTH CHECK*", ""]
+        lines: list[str] = []
 
+        # Header
+        lines.append("\U0001f3e5 *HEALTH*")
+
+        # Connectivity + market
         acct = state.get("account", {})
         connected = acct.get("equity", 0) > 0
-        lines.append(f"OANDA: {'Connected' if connected else 'DISCONNECTED'}")
+        conn_str = (
+            "\U0001f517 OANDA Connected"
+            if connected
+            else "\U0001f534 OANDA DISCONNECTED"
+        )
+        market_open = state.get("market_open", False)
+        market_str = "Market OPEN" if market_open else "Market CLOSED"
+        lines.append(f"{conn_str} | {market_str}")
 
+        # Protocol status
         proto = state.get("protocol", {})
-        status = proto.get("status", "unknown").upper()
-        lines.append(f"Protocol: {status}")
-        lines.append(f"Day: {proto.get('day', '?')}/{proto.get('duration', 30)}")
-
+        status = proto.get("status", "?").upper()
+        day = proto.get("day", "?")
+        duration = proto.get("duration", 30)
         positions = state.get("positions", [])
-        lines.append(f"Positions: {len(positions)}")
+        status_emoji = (
+            "\U0001f6a8"
+            if status == "DEGRADED"
+            else "\u2705"
+            if status == "RUNNING"
+            else "\u26a0\ufe0f"
+        )
+        lines.append(
+            f"{status_emoji} Day {day}/{duration} {status} | "
+            f"{len(positions)} position{'s' if len(positions) != 1 else ''}"
+        )
 
+        # Last tick + uptime
         last_tick = state.get("last_tick")
         if last_tick:
             ago = datetime.now(UTC) - last_tick
             minutes_ago = int(ago.total_seconds() // 60)
-            lines.append(f"Last tick: {minutes_ago}m ago")
+            tick_str = f"Last tick {minutes_ago}m ago"
         else:
-            lines.append("Last tick: unknown")
-
-        market_open = state.get("market_open", False)
-        lines.append(f"Market: {'OPEN' if market_open else 'CLOSED'}")
+            tick_str = "Last tick unknown"
 
         uptime = datetime.now(UTC) - self._start_time
         hours = int(uptime.total_seconds() // 3600)
         minutes = int((uptime.total_seconds() % 3600) // 60)
-        lines.append(f"Uptime: {hours}h {minutes}m")
+        lines.append(f"\U0001f552 {tick_str} | Up {hours}h {minutes}m")
 
         return _escape_markdown("\n".join(lines))
 
@@ -316,10 +355,13 @@ class TelegramCommandBot:
             Formatted positions message.
         """
         positions = state.get("positions", [])
-        if not positions:
+        pending = state.get("pending_orders", {})
+
+        if not positions and not pending:
             return "No open positions."
 
-        lines = ["*POSITION DETAILS*", ""]
+        lines: list[str] = []
+        lines.append(f"\U0001f4cb *POSITIONS ({len(positions)})*")
 
         for pos in positions:
             pair = pos.get("pair", "???")
@@ -328,7 +370,6 @@ class TelegramCommandBot:
             current = pos.get("current_price", 0)
             pnl = pos.get("unrealized_pnl", 0)
             stop = pos.get("stop_price")
-            hwm = pos.get("high_water_mark", 0)
             entry_time = pos.get("entry_time")
             tranche_count = pos.get("tranche_count", 1)
             financing = pos.get("financing", 0)
@@ -336,43 +377,58 @@ class TelegramCommandBot:
             profit_pct = (
                 ((current - entry) / entry * 100) if entry > 0 and current > 0 else 0
             )
-
-            # Decompose PnL: price movement vs carry income
             price_pnl = pnl - financing
+            dot = "\U0001f7e2" if pnl >= 0 else "\U0001f534"
 
             # Hold duration
-            if entry_time:
-                if isinstance(entry_time, str):
-                    hold = "N/A"
-                else:
-                    delta = datetime.now(UTC) - entry_time
-                    hold = f"{delta.days}d {delta.seconds // 3600}h"
+            if entry_time and not isinstance(entry_time, str):
+                delta = datetime.now(UTC) - entry_time
+                hold = f"{delta.days}d {delta.seconds // 3600}h"
             else:
                 hold = "N/A"
 
             # Risk from stop
             risk_pct = ((entry - stop) / entry * 100) if stop and entry > 0 else 0
 
-            lines.append(f"*{pair}*")
-            lines.append(f"  Units: {units:,} (tranches: {tranche_count})")
-            lines.append(f"  Entry: {entry:.5f}")
-            lines.append(f"  Current: {current:.5f} ({profit_pct:+.2f}%)")
-            lines.append(
-                f"  PnL: ${pnl:+,.2f}  (price: ${price_pnl:+,.2f}, carry: ${financing:+,.2f})"
-            )
-            if stop:
-                lines.append(f"  Stop: {stop:.3f} (risk: {risk_pct:.2f}%)")
-            else:
-                lines.append("  Stop: NONE")
-            lines.append(f"  HWM: {hwm:.5f}")
-            lines.append(f"  Held: {hold}")
             lines.append("")
+            lines.append(f"{dot} *{pair}*")
+            lines.append(
+                f"{units:,}u \u00d7 {tranche_count} "
+                f"tranche{'s' if tranche_count != 1 else ''} | Held {hold}"
+            )
+            lines.append(f"Entry {entry:.3f} \u2192 {current:.3f} ({profit_pct:+.1f}%)")
+            pnl_line = f"PnL ${pnl:+,.2f}"
+            if financing != 0:
+                pnl_line += f" (price ${price_pnl:+,.2f}, carry ${financing:+,.2f})"
+            lines.append(pnl_line)
+            if stop:
+                lines.append(f"SL {stop:.3f} (risk {risk_pct:.1f}%)")
+            else:
+                lines.append("SL none")
 
-        total_pnl = sum(p.get("unrealized_pnl", 0) for p in positions)
-        total_fin = sum(p.get("financing", 0) for p in positions)
-        lines.append(f"*Total PnL: ${total_pnl:+,.2f}*")
-        if total_fin != 0:
-            lines.append(f"*Total Carry: ${total_fin:+,.2f}*")
+        # Pending orders
+        if pending:
+            lines.append("")
+            for pair, p in pending.items():
+                tick_count = p.get("tick_count", 0)
+                lines.append(f"\u23f3 *Pending: {pair}*")
+                lines.append(
+                    f"{p.get('units', 0):,}u "
+                    f"@ {p.get('limit_price', 0):.3f} "
+                    f"(tick {tick_count})"
+                )
+
+        # Footer totals
+        if positions:
+            lines.append("")
+            lines.append("\u2500" * 14)
+            total_pnl = sum(p.get("unrealized_pnl", 0) for p in positions)
+            total_fin = sum(p.get("financing", 0) for p in positions)
+            pnl_emoji = "\U0001f7e2" if total_pnl >= 0 else "\U0001f534"
+            footer = f"Total {pnl_emoji} ${total_pnl:+,.2f}"
+            if total_fin != 0:
+                footer += f" | Carry ${total_fin:+,.2f}"
+            lines.append(footer)
 
         return _escape_markdown("\n".join(lines))
 
@@ -386,18 +442,12 @@ class TelegramCommandBot:
             Formatted help message.
         """
         lines = [
-            "*Available Commands*",
+            "\u2753 *COMMANDS*",
             "",
-            "/status — Full system status",
-            "  Account, protocol, all positions, PnL",
-            "",
-            "/health — Quick health check",
-            "  Connectivity, protocol, last tick, uptime",
-            "",
-            "/positions — Detailed position breakdown",
-            "  Per-pair entry, stop, risk, duration",
-            "",
-            "/help — This message",
+            "\U0001f4ca /status \u2014 Full system overview",
+            "\U0001f3e5 /health \u2014 Quick health check",
+            "\U0001f4cb /positions \u2014 Detailed per-pair breakdown",
+            "\u2753 /help \u2014 This message",
         ]
         return _escape_markdown("\n".join(lines))
 

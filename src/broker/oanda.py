@@ -3,7 +3,8 @@
 Wraps the oandapyV20 library to provide a clean interface for:
 - Fetching historical candles
 - Getting current prices
-- Submitting market orders
+- Submitting market and limit orders
+- Managing pending orders (query and cancel)
 - Closing positions
 - Querying account state and swap rates
 
@@ -29,6 +30,7 @@ import oandapyV20.endpoints.positions as positions_api
 import oandapyV20.endpoints.pricing as pricing
 import oandapyV20.endpoints.trades as trades_api
 from oandapyV20.contrib.requests import (
+    LimitOrderRequest,
     MarketOrderRequest,
     StopLossDetails,
 )
@@ -623,6 +625,222 @@ class OandaBroker:
         logger.warning(
             "Unexpected response modifying stop for trade %s: %s",
             trade_id,
+            list(response.keys()),
+        )
+        return False
+
+    @_retry
+    def submit_limit_order(
+        self,
+        pair: str,
+        side: OrderSide,
+        units: int,
+        price: float,
+        stop_loss_price: Optional[float] = None,
+        time_in_force: str = "GTC",
+    ) -> Optional[Order]:
+        """Submit a limit order for better fill prices.
+
+        Places a GTC limit order at the specified price with an optional
+        broker-side stop-loss attached on fill. Unlike market orders,
+        limit orders only execute when the price reaches the limit level,
+        potentially saving 1-2 pips of spread cost per entry.
+
+        Args:
+            pair: Currency pair (e.g., "USD/JPY").
+            side: BUY or SELL.
+            units: Number of units (positive).
+            price: Limit price. For BUY, order fills at this price
+                or lower. Rounded to 3 decimals (JPY pairs).
+            stop_loss_price: If provided, attaches a stop-loss on fill.
+            time_in_force: "GTC" (Good Till Cancelled) by default.
+
+        Returns:
+            Order object with status SUBMITTED (pending fill) and
+            the OANDA order ID stored in trade_id, or None on failure.
+            The order may also be immediately filled if the limit price
+            is at or above the current ask (BUY) — in that case the
+            status will be FILLED.
+        """
+        instrument = _to_oanda_instrument(pair)
+        signed_units = units if side == OrderSide.BUY else -units
+        rounded_price = round(price, 3)
+
+        # Build stop-loss on-fill payload
+        sl_on_fill = None
+        if stop_loss_price is not None:
+            sl_on_fill = StopLossDetails(price=round(stop_loss_price, 3)).data
+            logger.info(
+                "Limit order: attaching stop-loss @ %.3f for %s",
+                stop_loss_price,
+                pair,
+            )
+
+        lo = LimitOrderRequest(
+            instrument=instrument,
+            units=signed_units,
+            price=f"{rounded_price:.3f}",
+            stopLossOnFill=sl_on_fill,
+            timeInForce=time_in_force,
+        )
+
+        endpoint = orders_api.OrderCreate(accountID=self.account_id, data=lo.data)
+        response = self.client.request(endpoint)
+
+        # Case 1: Immediate fill (limit at or better than market)
+        fill_data = response.get("orderFillTransaction")
+        if fill_data:
+            fill_price = float(fill_data["price"])
+            fill_units = abs(int(fill_data["units"]))
+            trade_id = None
+            trade_opened = fill_data.get("tradeOpened")
+            if trade_opened:
+                trade_id = str(trade_opened["tradeID"])
+
+            order = Order(
+                pair=pair,
+                side=side,
+                order_type=OrderType.LIMIT,
+                quantity=float(units),
+                limit_price=rounded_price,
+                status=OrderStatus.FILLED,
+                filled_at=datetime.now(),
+                trade_id=trade_id,
+                fills=[
+                    Fill(
+                        fill_id=fill_data["id"],
+                        order_id=fill_data.get("orderID", ""),
+                        timestamp=datetime.now(),
+                        price=fill_price,
+                        quantity=float(fill_units),
+                        commission=float(fill_data.get("commission", "0")),
+                        slippage=0.0,
+                    )
+                ],
+            )
+            logger.info(
+                "Limit order IMMEDIATELY filled: %s %s %d units @ %.5f "
+                "(limit=%.3f, trade_id=%s)",
+                side.name,
+                pair,
+                fill_units,
+                fill_price,
+                rounded_price,
+                trade_id or "N/A",
+            )
+            return order
+
+        # Case 2: Order created but not yet filled (pending)
+        order_txn = response.get("orderCreateTransaction")
+        if order_txn:
+            oanda_order_id = str(order_txn.get("id", ""))
+            order = Order(
+                pair=pair,
+                side=side,
+                order_type=OrderType.LIMIT,
+                quantity=float(units),
+                limit_price=rounded_price,
+                status=OrderStatus.SUBMITTED,
+                submitted_at=datetime.now(),
+                trade_id=oanda_order_id,  # Store OANDA order ID
+            )
+            logger.info(
+                "Limit order PENDING: %s %s %d units @ %.3f (order_id=%s, stop=%.3f)",
+                side.name,
+                pair,
+                units,
+                rounded_price,
+                oanda_order_id,
+                stop_loss_price or 0.0,
+            )
+            return order
+
+        # Case 3: Rejection
+        reject = response.get("orderRejectTransaction", {})
+        reason = reject.get("rejectReason", "Unknown rejection")
+        logger.error("Limit order rejected for %s: %s", pair, reason)
+        return Order(
+            pair=pair,
+            side=side,
+            order_type=OrderType.LIMIT,
+            quantity=float(units),
+            limit_price=rounded_price,
+            status=OrderStatus.REJECTED,
+            reject_reason=reason,
+        )
+
+    @_retry
+    def get_pending_orders(self) -> Optional[list[dict]]:
+        """Get all pending (unfilled) orders from OANDA.
+
+        Queries the account's open orders. Useful for tracking limit
+        orders that haven't filled yet.
+
+        Returns:
+            List of order dicts with keys: order_id, pair, units,
+            price, order_type, time_in_force, stop_loss_price.
+            Returns None on failure.
+        """
+        endpoint = orders_api.OrdersPending(accountID=self.account_id)
+        response = self.client.request(endpoint)
+        raw_orders = response.get("orders", [])
+
+        result = []
+        for o in raw_orders:
+            sl_on_fill = o.get("stopLossOnFill")
+            sl_price = None
+            if sl_on_fill:
+                sl_price = float(sl_on_fill.get("price", "0"))
+
+            result.append(
+                {
+                    "order_id": str(o["id"]),
+                    "pair": _from_oanda_instrument(o.get("instrument", "")),
+                    "units": abs(int(o.get("units", "0"))),
+                    "price": float(o.get("price", "0")),
+                    "order_type": o.get("type", "UNKNOWN"),
+                    "time_in_force": o.get("timeInForce", "GTC"),
+                    "stop_loss_price": sl_price,
+                    "create_time": o.get("createTime", ""),
+                }
+            )
+
+        return result
+
+    @_retry
+    def cancel_order(self, order_id: str) -> bool:
+        """Cancel a pending order by OANDA order ID.
+
+        Args:
+            order_id: The OANDA order ID to cancel.
+
+        Returns:
+            True if cancelled successfully, False on failure.
+        """
+        endpoint = orders_api.OrderCancel(
+            accountID=self.account_id,
+            orderID=order_id,
+        )
+        response = self.client.request(endpoint)
+
+        cancel_txn = response.get("orderCancelTransaction")
+        if cancel_txn:
+            logger.info(
+                "Order %s cancelled (reason: %s)",
+                order_id,
+                cancel_txn.get("reason", "CLIENT_REQUEST"),
+            )
+            return True
+
+        reject_txn = response.get("orderCancelRejectTransaction")
+        if reject_txn:
+            reason = reject_txn.get("rejectReason", "unknown")
+            logger.error("Cancel rejected for order %s: %s", order_id, reason)
+            return False
+
+        logger.warning(
+            "Unexpected cancel response for order %s: %s",
+            order_id,
             list(response.keys()),
         )
         return False
