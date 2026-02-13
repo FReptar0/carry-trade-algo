@@ -181,9 +181,19 @@ class TradingProtocol:
         self.abort_reason = None
 
     def record_day(self, day_result: ProtocolDay) -> None:
-        """Record a day's results."""
+        """Record a day's results.
+
+        If a record for the same date already exists, it is replaced
+        (last write wins) to prevent duplicate day counts.
+        """
         if self.status not in (ProtocolStatus.RUNNING, ProtocolStatus.DEGRADED):
             raise ValueError(f"Cannot record day when status is {self.status}")
+
+        # Replace existing day if same date (prevent duplicates)
+        for i, existing in enumerate(self.days):
+            if existing.date == day_result.date:
+                self.days[i] = day_result
+                return
 
         self.days.append(day_result)
 
