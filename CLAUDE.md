@@ -284,28 +284,81 @@ PROJECT COMPLETE - All 10 phases + 5 autonomous phases (A-E) implemented and tes
   - Added GBP/JPY, NZD/JPY, EUR/JPY, CAD/JPY (6 pairs total)
   - V3 max_positions 2 → 6, position_size_pct 8% → 4%
   - Circuit breaker max_positions 3 → 6
-  - GBP/JPY opened at 212.630 (golden cross), NZD/JPY at 93.522 (strong uptrend)
-  - EUR/JPY, CAD/JPY, USD/JPY monitoring — MAs not yet aligned
-
-- **Live positions as of 2026-02-03:**
-  - AUD/JPY: 1,000 units @ 108.156
-  - GBP/JPY: 1,000 units @ 212.630
-  - NZD/JPY: 1,000 units @ 93.522
-
-- **Credentials (.env, gitignored):**
-  - OANDA practice account configured and connected
-  - Telegram alerts active (bot token + chat ID)
-  - FMP_API_KEY stored (free tier, stock data only — economic calendar is paid)
-  - Forex Factory calendar: free, no key needed
 
 - **2026-02-02: Drawdown-aware position sizing**
   - DynamicSizer: quadratic decay `factor = max(0.25, 1.0 - (dd/0.20)^2)`
   - Smoothly reduces new position size: 0% DD → 1.0, 10% DD → 0.75, 20% DD → 0.25 (floor)
   - Circuit breaker unchanged (still halts at 20%), this adds a layer before it
-  - Runner passes `snapshot.drawdown` to `calculate_size()` — existing positions unaffected
-  - 6 new tests, 490 total passing
 
-- **Enhancement roadmap:** see docs/ENHANCEMENTS.md
-  - Phase 1 (best to have): Multi-pair ✅, limit orders, drawdown-aware rebalancing ✅, continuous vol scaling
-  - Phase 2 (nice to have): Cross-asset signals, time-of-day seasonality, sentiment data, multi-TF refinement
-  - Phase 3 (future): Short-side carry, ensemble strategies, deep RL, macro event model
+- **2026-02-06: Limit orders for entry** ✅
+  - Entry signals now place limit orders at bid price (not market orders)
+  - Saves 1-2 pips on entry by avoiding bid-ask spread
+  - Pending orders tracked in `_pending_orders` dict, checked each tick
+  - Stale orders cancelled after 2 ticks (~2 hours)
+  - Graceful handling of rejection, partial fills, broker latency
+
+- **2026-02-08: Continuous volatility scaling** ✅
+  - Trims positions when `current_atr / entry_atr > 1.5x`
+  - Restores original dollar-risk exposure by reducing units
+  - 24-hour cooldown per pair, 25% floor (never trim below 25% of original)
+  - Sends Telegram WARNING alert on each trim
+  - `entry_atr` stored at entry; estimated for synced positions
+
+- **2026-02-08: OANDA openTime sync** ✅
+  - Synced positions now use OANDA `openTime` (RFC 3339) for entry_time
+  - Fixes position age tracking for ExitManager time-based exits
+
+- **2026-02-09: Position state persistence** ✅
+  - Every tick persists `_strategy_positions` to `position_states` SQLite table
+  - Fields: high_water_mark, entry_atr, original_units, tranche_count, levels_taken, financing
+  - On restart, loads persisted state and reconciles with broker
+  - Selective restore (high/low water marks only if they exceed/undercut current prices)
+  - Deleted after position closes (no stale data restoration)
+
+- **2026-02-09: Market-aware watchdog** ✅
+  - Watchdog accepts `market_open_check` callable
+  - Suspends alerts when forex market is closed (weekends)
+  - Resets heartbeat timer when market reopens
+  - Prevents false CRITICAL alerts during weekend closure
+
+- **2026-02-09: Market open/close notifications** ✅
+  - Telegram notifications when forex market opens/closes
+  - "Market closed - trading paused until ..." / "Market open - trading resumed"
+
+- **2026-02-09: Automated reports** ✅
+  - Daily reports at 22:00 UTC via `scripts/generate_report.py`
+  - Weekly reports Sunday 08:00 UTC
+  - Protocol progress (day X/30), win rate, positions, PnL
+
+- **2026-02-13: Disable support_break exits** ✅ (AUDIT FIX)
+  - Root cause of Feb 10 losses identified: `support_break` exit logic
+  - Designed for daily/weekly timeframes, fired too often on hourly data
+  - Found 20-bar swing low detection triggering on normal pullbacks
+  - Set `use_sr_exits=False` in ExitManagerConfig
+  - Regime exits kept active (they were profitable)
+
+## Current Live Status (as of 2026-02-13)
+
+- **Protocol Day**: 11 of 30 (started 2026-02-03)
+- **Protocol Status**: RUNNING
+- **Equity**: $99,587.88 (-$412.12 from $100,000, -0.41%)
+- **Open Positions**: 0 (all stopped out Feb 10)
+- **Closed Trades**: 28
+- **Key Event**: Feb 10 — $534 loss from 6 trades closed (support_break + stop_loss)
+- **Fix Applied**: Disabled support_break exits to prevent over-trading
+
+## Credentials (.env, gitignored)
+- OANDA practice account configured and connected
+- Telegram alerts active (bot token + chat ID)
+- Forex Factory calendar: free, no key needed
+
+## Deployment
+- AWS EC2 (Amazon Linux 2023) via Docker
+- Container: `carry-trade-algo`
+- SSH: `ssh -i Odoo_test.pem ec2-user@34.224.93.178`
+- Logs: `docker logs carry-trade-algo --tail 100`
+
+## Enhancement Roadmap (see docs/ENHANCEMENTS.md)
+- Phase 1 (best to have): Multi-pair ✅, limit orders ✅, drawdown-aware ✅, vol scaling ✅
+- Phase 2 (nice to have): Cross-asset signals, time-of-day seasonality, sentiment data
+- Phase 3 (future): Short-side carry, ensemble strategies, deep RL

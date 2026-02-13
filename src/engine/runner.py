@@ -207,7 +207,7 @@ class TradingRunner:
             min_hold_hours=24,
             profit_scale_enabled=True,
             regime_exit_enabled=True,
-            use_sr_exits=True,
+            use_sr_exits=False,  # Disabled: triggers too often on hourly data
         )
 
         # Restore or create protocol
