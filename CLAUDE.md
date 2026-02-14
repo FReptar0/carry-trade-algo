@@ -356,14 +356,40 @@ The support_break exit logic was designed for daily/weekly timeframes but was in
 2. Rapid entry/exit cycling (same pair entered 4x in one day)
 3. Cascading stop losses from poorly-timed re-entries
 
-## Current Live Status (as of 2026-02-14)
+## Current Live Status (as of 2026-02-14 22:00 UTC)
 
 - **Protocol Day**: 12 of 34 (started 2026-02-03, extended +4 days)
 - **Protocol Status**: RUNNING
-- **Equity**: ~$100,122 (restored to pre-bug level)
+- **Equity**: $100,122.42 (restored to pre-bug level)
 - **Open Positions**: 0 (waiting for trend alignment)
-- **Market Status**: CLOSED (weekend - reopens Sun 22:00 UTC)
+- **Market Status**: CLOSED (weekend - reopens Sun Feb 15 22:00 UTC)
 - **Fix Applied**: support_break exits disabled, balance restored
+
+## Why No Trades Are Happening (Feb 11-14)
+
+All 6 JPY pairs are in **hourly DOWNTREND** (50MA < 200MA):
+
+| Pair | Price vs 50MA | 50MA vs 200MA | Status |
+|------|---------------|---------------|--------|
+| USD/JPY | -0.14% | -1.40% | DOWNTREND |
+| AUD/JPY | -0.39% | -0.65% | DOWNTREND |
+| GBP/JPY | +0.03% | -1.48% | DOWNTREND |
+| NZD/JPY | -0.11% | -1.12% | DOWNTREND |
+| EUR/JPY | -0.07% | -1.23% | DOWNTREND |
+| CAD/JPY | -0.18% | -1.24% | DOWNTREND |
+
+V3 requires `price > 50MA > 200MA` for entry. This is **correct behavior** - the strategy protects capital by not entering during downtrends.
+
+**When entries resume**: When JPY weakens and pairs rally, causing 50MA to cross above 200MA (golden cross). Estimated 3-14 days depending on market movement.
+
+## Pair Diversification Analysis (Feb 14)
+
+Analyzed adding non-JPY pairs (CHF, EUR cross). Results:
+- **JPY pairs backtest (2023-2024)**: +5.18% ✓
+- **CHF pairs backtest**: -17.48% ✗ (0% win rate)
+- **EUR cross backtest**: -12.77% ✗ (0% win rate)
+
+**Conclusion**: V3 strategy was optimized for JPY pairs only. Do NOT add other pairs without creating separate optimized parameters. CHF/EUR pairs have different volatility characteristics that don't match V3's MA crossover logic.
 
 ## Credentials (.env, gitignored)
 - OANDA practice account configured and connected
