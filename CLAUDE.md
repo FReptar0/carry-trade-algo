@@ -337,15 +337,33 @@ PROJECT COMPLETE - All 10 phases + 5 autonomous phases (A-E) implemented and tes
   - Set `use_sr_exits=False` in ExitManagerConfig
   - Regime exits kept active (they were profitable)
 
-## Current Live Status (as of 2026-02-13)
+- **2026-02-14: Bug period exclusion & protocol extension** ✅
+  - Identified Feb 10-13 as "bug period" with artificial losses from support_break
+  - Extended protocol from 30 → 34 days to compensate
+  - Added $534.54 to OANDA account to restore pre-bug balance (~$100,122)
+  - Rationale: Protocol tests V3 strategy validity, not implementation bugs
+  - Bug-period losses excluded from final performance evaluation
 
-- **Protocol Day**: 11 of 30 (started 2026-02-03)
+## Bug Period Exclusion (Feb 10-13, 2026)
+
+The following losses were caused by the `support_break` bug and are excluded from V3 strategy evaluation:
+- Feb 10: -$534.07 (6 trades closed by buggy support_break + cascading stops)
+- Feb 11: -$1.29 (1 trade closed)
+- Total excluded: $535.36
+
+The support_break exit logic was designed for daily/weekly timeframes but was incorrectly applied to hourly data, causing:
+1. Premature exits within 1-2 hours of entry
+2. Rapid entry/exit cycling (same pair entered 4x in one day)
+3. Cascading stop losses from poorly-timed re-entries
+
+## Current Live Status (as of 2026-02-14)
+
+- **Protocol Day**: 12 of 34 (started 2026-02-03, extended +4 days)
 - **Protocol Status**: RUNNING
-- **Equity**: $99,587.88 (-$412.12 from $100,000, -0.41%)
-- **Open Positions**: 0 (all stopped out Feb 10)
-- **Closed Trades**: 28
-- **Key Event**: Feb 10 — $534 loss from 6 trades closed (support_break + stop_loss)
-- **Fix Applied**: Disabled support_break exits to prevent over-trading
+- **Equity**: ~$100,122 (restored to pre-bug level)
+- **Open Positions**: 0 (waiting for trend alignment)
+- **Market Status**: CLOSED (weekend - reopens Sun 22:00 UTC)
+- **Fix Applied**: support_break exits disabled, balance restored
 
 ## Credentials (.env, gitignored)
 - OANDA practice account configured and connected
