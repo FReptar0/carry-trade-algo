@@ -3,6 +3,7 @@
 Runs a long-polling loop in a daemon thread, listening for commands:
 - /status  — Full system status (positions, PnL, stops, protocol)
 - /health  — Quick health check (uptime, last tick, connectivity)
+- /trends  — MA trend analysis for all pairs (entry proximity)
 - /help    — List available commands
 
 Uses only urllib (no new dependencies). Thread-safe: reads runner
@@ -20,6 +21,8 @@ import urllib.error
 from datetime import datetime, timedelta
 from typing import Any, Callable, Optional
 from zoneinfo import ZoneInfo
+
+import pandas as pd
 
 UTC = ZoneInfo("UTC")
 
@@ -69,6 +72,7 @@ class TelegramCommandBot:
             "health": self._handle_health,
             "help": self._handle_help,
             "positions": self._handle_positions,
+            "trends": self._handle_trends,
         }
 
     def start(self) -> None:
@@ -104,6 +108,7 @@ class TelegramCommandBot:
             },
             {"command": "health", "description": "Quick health check"},
             {"command": "positions", "description": "Detailed position breakdown"},
+            {"command": "trends", "description": "MA trend analysis & entry proximity"},
             {"command": "help", "description": "List available commands"},
         ]
         try:
@@ -450,6 +455,101 @@ class TelegramCommandBot:
 
         return _escape_markdown("\n".join(lines))
 
+    def _handle_trends(self, state: dict) -> str:
+        """Build MA trend analysis for all pairs.
+
+        Shows 50MA vs 200MA gap, price vs 50MA, and how close each
+        pair is to triggering a V3 entry (golden cross).
+
+        Args:
+            state: Current system state including candle cache.
+
+        Returns:
+            Formatted trends message.
+        """
+        candle_cache: dict[str, pd.DataFrame] = state.get("candle_cache", {})
+        pairs: list[str] = state.get("pairs", [])
+
+        if not candle_cache:
+            return "No candle data yet. Wait for next strategy tick."
+
+        lines: list[str] = []
+
+        # Header
+        acct = state.get("account", {})
+        equity = acct.get("equity", 0)
+        proto = state.get("protocol", {})
+        day = proto.get("day", "?")
+        duration = proto.get("duration", 34)
+        positions = state.get("positions", [])
+        lines.append(f"\U0001f4c8 *TREND REPORT*")
+        lines.append(
+            f"Day {day}/{duration} | ${equity:,.0f} | "
+            f"{len(positions)} pos"
+        )
+        lines.append("")
+
+        # Per-pair analysis
+        pair_data: list[tuple[str, str, float]] = []
+        for pair in pairs:
+            oanda_pair = pair.replace("/", "_")
+            df = candle_cache.get(oanda_pair) or candle_cache.get(pair)
+            if df is None or len(df) < 200:
+                lines.append(f"{pair}: insufficient data")
+                continue
+
+            price = float(df["close"].iloc[-1])
+            ma50 = float(df["close"].rolling(50).mean().iloc[-1])
+            ma200 = float(df["close"].rolling(200).mean().iloc[-1])
+
+            p_vs_50 = (price - ma50) / ma50 * 100
+            ma50_vs_200 = (ma50 - ma200) / ma200 * 100
+
+            if ma50 > ma200 and price > ma50:
+                trend = "UPTREND"
+                icon = "\U0001f7e2"
+            elif ma50 > ma200:
+                trend = "PULLBACK"
+                icon = "\U0001f7e1"
+            elif price > ma200:
+                trend = "RECOVERING"
+                icon = "\U0001f7e1"
+            else:
+                trend = "DOWNTREND"
+                icon = "\U0001f534"
+
+            gap_pct = (
+                (ma200 - ma50) / ma200 * 100 if ma50 < ma200 else 0
+            )
+
+            lines.append(f"{icon} *{pair}* {trend}")
+            lines.append(
+                f"  Price {price:.3f} | 50MA {ma50:.3f} | 200MA {ma200:.3f}"
+            )
+            detail = f"  Pvs50 {p_vs_50:+.2f}% | 50vs200 {ma50_vs_200:+.2f}%"
+            if gap_pct > 0:
+                detail += f" | Gap {gap_pct:.2f}%"
+            lines.append(detail)
+            lines.append("")
+
+            pair_data.append((pair, trend, gap_pct))
+
+        # Summary
+        uptrends = [p for p, t, _ in pair_data if t == "UPTREND"]
+        closest = min(pair_data, key=lambda x: x[2] if x[2] > 0 else 999, default=None)
+
+        lines.append("\U0001f3af *SUMMARY*")
+        if uptrends:
+            lines.append(f"Ready to trade: {', '.join(uptrends)}")
+        else:
+            lines.append("No pairs in uptrend yet")
+        if closest and closest[2] > 0:
+            lines.append(
+                f"Closest to entry: {closest[0]} ({closest[2]:.2f}% gap)"
+            )
+
+        return _escape_markdown("\n".join(lines))
+
     def _handle_help(self, state: dict) -> str:
         """Build help message listing all commands.
 
@@ -465,6 +565,7 @@ class TelegramCommandBot:
             "\U0001f4ca /status \u2014 Full system overview",
             "\U0001f3e5 /health \u2014 Quick health check",
             "\U0001f4cb /positions \u2014 Detailed per-pair breakdown",
+            "\U0001f4c8 /trends \u2014 MA trend analysis & entry proximity",
             "\u2753 /help \u2014 This message",
         ]
         return _escape_markdown("\n".join(lines))

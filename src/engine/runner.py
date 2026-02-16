@@ -342,6 +342,8 @@ class TradingRunner:
             "performance": perf,
             "last_tick": self._last_tick_time,
             "market_open": ForexMarketHours.is_market_open(datetime.now(UTC)),
+            "candle_cache": dict(self._candle_cache),
+            "pairs": self.config.pairs,
         }
 
     def _init_calendar(self) -> EconomicCalendar:
