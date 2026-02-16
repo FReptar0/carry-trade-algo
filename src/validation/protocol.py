@@ -228,13 +228,18 @@ class TradingProtocol:
         if cb_count >= self.abort_criteria.circuit_breaker_count:
             return True, f"Circuit breaker triggered {cb_count} times"
 
-        # 4. Check win rate after enough trades
+        # 4. Check win rate after enough trades — only active trading days
         total_trades = sum(d.trades_closed for d in self.days)
         if total_trades >= 10:
-            profitable_days = sum(1 for d in self.days if d.is_profitable)
-            win_rate = profitable_days / len(self.days)
-            if win_rate < self.abort_criteria.min_win_rate:
-                return True, f"Win rate too low: {win_rate:.1%}"
+            active_days = [
+                d for d in self.days
+                if d.trades_opened > 0 or d.trades_closed > 0 or d.daily_pnl != 0
+            ]
+            if active_days:
+                profitable_days = sum(1 for d in active_days if d.is_profitable)
+                win_rate = profitable_days / len(active_days)
+                if win_rate < self.abort_criteria.min_win_rate:
+                    return True, f"Win rate too low: {win_rate:.1%}"
 
         return False, None
 
@@ -278,13 +283,18 @@ class TradingProtocol:
         if cb_count >= criteria.circuit_breaker_count:
             return True, f"Circuit breaker triggered {cb_count} times (warning)"
 
-        # 4. Low win rate (30%)
+        # 4. Low win rate (30%) — only count days with trading activity
         total_trades = sum(d.trades_closed for d in self.days)
         if total_trades >= 10:
-            profitable_days = sum(1 for d in self.days if d.is_profitable)
-            win_rate = profitable_days / len(self.days)
-            if win_rate < criteria.min_win_rate:
-                return True, f"Win rate low: {win_rate:.1%} (warning)"
+            active_days = [
+                d for d in self.days
+                if d.trades_opened > 0 or d.trades_closed > 0 or d.daily_pnl != 0
+            ]
+            if active_days:
+                profitable_days = sum(1 for d in active_days if d.is_profitable)
+                win_rate = profitable_days / len(active_days)
+                if win_rate < criteria.min_win_rate:
+                    return True, f"Win rate low: {win_rate:.1%} (warning)"
 
         return False, None
 
