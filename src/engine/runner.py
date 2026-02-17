@@ -112,8 +112,8 @@ class RunnerConfig:
     check_interval_minutes: int = 60
     candle_lookback: int = 300
     position_size_units: int = 10000
-    swap_long_default: float = 0.00005
-    swap_short_default: float = -0.00005
+    swap_long_default: float = 0.0
+    swap_short_default: float = 0.0
     initial_equity: float = 100000.0
     log_dir: str = "logs"
     db_path: str = "data/trading.db"
@@ -219,10 +219,15 @@ class TradingRunner:
         # Daily tracking
         self._today: Optional[date] = None
         self._day_start_equity: float = self.config.initial_equity
+        self._week_start_equity: float = self.config.initial_equity
         self._trades_opened_today: int = 0
         self._trades_closed_today: int = 0
         self._max_drawdown_today: float = 0.0
         self._cb_triggered_today: bool = False
+
+        # Thread safety for bot access
+        import threading
+        self._state_lock = threading.Lock()
 
         # Track open positions per pair (from strategy signals)
         self._strategy_positions: dict[str, dict] = {}
@@ -261,12 +266,17 @@ class TradingRunner:
     def get_system_state(self) -> dict:
         """Collect current system state for Telegram command responses.
 
-        Thread-safe: reads internal state without mutating it.
+        Thread-safe: uses lock to prevent concurrent access with runner thread.
         Called from the TelegramCommandBot polling thread.
 
         Returns:
             Dict with account, protocol, positions, performance info.
         """
+        with self._state_lock:
+            return self._get_system_state_unlocked()
+
+    def _get_system_state_unlocked(self) -> dict:
+        """Internal state collection (must hold _state_lock)."""
         # Account state (cached to avoid hammering OANDA from the bot thread)
         acct = self.broker.get_account_state() or {}
 
@@ -688,11 +698,12 @@ class TradingRunner:
         )
 
         # 9. Check circuit breakers
+        weekly_pnl = equity - self._week_start_equity
         portfolio_state = PortfolioState(
             equity=equity,
             high_water_mark=self.monitor.high_water_mark,
             daily_pnl=daily_pnl,
-            weekly_pnl=daily_pnl,  # Simplified for now
+            weekly_pnl=weekly_pnl,
             open_positions=pos_count,
         )
         violations = self.circuit_breaker.check_limits(portfolio_state, now)
@@ -984,6 +995,18 @@ class TradingRunner:
                 open_pairs
             )
 
+            # Regime multiplier from detector
+            regime_mult = 1.0
+            regime_state = self._detect_regime_safe(df)
+            if regime_state is not None:
+                try:
+                    from src.regime.adapters import RegimeAdapter
+                    adapter = RegimeAdapter()
+                    adapted = adapter.adapt_from_state(regime_state)
+                    regime_mult = max(0.1, min(adapted.position_size_mult, 2.0))
+                except Exception:
+                    regime_mult = 1.0
+
             units = self.dynamic_sizer.calculate_size(
                 pair=pair,
                 equity=equity,
@@ -992,7 +1015,7 @@ class TradingRunner:
                 win_rate=win_rate if win_rate > 0 else 0.5,
                 avg_win=avg_win if avg_win > 0 else 200.0,
                 avg_loss=avg_loss if avg_loss > 0 else 100.0,
-                regime_mult=1.0,
+                regime_mult=regime_mult,
                 correlation_factor=corr_factor,
                 drawdown_pct=stats.drawdown,
             )
@@ -1661,6 +1684,14 @@ class TradingRunner:
                 return
 
             add_units = self.scale_manager.tranche_units(position["units"])
+
+            # Cap total position at DynamicSizer max_units
+            max_units = self.dynamic_sizer.max_units
+            if position["units"] + add_units > max_units:
+                add_units = max(0, max_units - position["units"])
+                if add_units <= 0:
+                    logger.debug("Scale-in skipped for %s (at max_units %d)", pair, max_units)
+                    return
 
             # Calculate broker-side stop for the new tranche
             atr_stop_mult = self.strategy.config.atr_stop_mult
@@ -2432,6 +2463,10 @@ class TradingRunner:
         acct = self.broker.get_account_state()
         if acct:
             self._day_start_equity = acct["equity"]
+            # Reset week start equity on Monday (weekday 0)
+            if today.weekday() == 0:
+                self._week_start_equity = acct["equity"]
+                logger.info("New trading week: week_start_equity=%.2f", acct["equity"])
         self._trades_opened_today = 0
         self._trades_closed_today = 0
         self._max_drawdown_today = 0.0

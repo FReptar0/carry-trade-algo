@@ -387,8 +387,12 @@ class TradingProtocol:
         )
         current_drawdown = (peak_equity - current_equity) / peak_equity
 
-        profitable_days = sum(1 for d in days_to_check if d.is_profitable)
-        win_rate = profitable_days / len(days_to_check)
+        active_days_check = [
+            d for d in days_to_check
+            if d.trades_opened > 0 or d.trades_closed > 0 or d.daily_pnl != 0
+        ]
+        profitable_days = sum(1 for d in active_days_check if d.is_profitable)
+        win_rate = profitable_days / len(active_days_check) if active_days_check else 0.0
 
         # Calculate rolling Sharpe
         returns = [d.daily_return for d in days_to_check]
@@ -474,8 +478,12 @@ class TradingProtocol:
             (peak_equity - d.ending_equity) / peak_equity for d in self.days
         )
 
-        profitable_days = sum(1 for d in self.days if d.is_profitable)
-        win_rate = profitable_days / len(self.days)
+        active_days = [
+            d for d in self.days
+            if d.trades_opened > 0 or d.trades_closed > 0 or d.daily_pnl != 0
+        ]
+        profitable_days = sum(1 for d in active_days if d.is_profitable)
+        win_rate = profitable_days / len(active_days) if active_days else 0.0
 
         returns = [d.daily_return for d in self.days]
         if len(returns) > 1 and np.std(returns) > 0:

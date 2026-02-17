@@ -22,7 +22,7 @@ UTC = ZoneInfo("UTC")
 EST = ZoneInfo("America/New_York")
 logger = logging.getLogger(__name__)
 
-RELEVANT_CURRENCIES = {"USD", "JPY", "AUD", "EUR"}
+RELEVANT_CURRENCIES = {"USD", "JPY", "AUD", "EUR", "GBP", "NZD", "CAD"}
 
 CALENDAR_URL = (
     "https://nfs.faireconomy.media/ff_calendar_thisweek.json"

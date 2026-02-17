@@ -142,6 +142,7 @@ class OandaBroker:
         self.client = oandapyV20.API(
             access_token=config.access_token,
             environment=config.environment,
+            request_params={"timeout": 30},
         )
         self.account_id = config.account_id
 

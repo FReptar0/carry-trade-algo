@@ -16,7 +16,7 @@ import math
 logger = logging.getLogger(__name__)
 
 DEFAULT_MIN_UNITS = 1000
-DEFAULT_MAX_UNITS = 100000
+DEFAULT_MAX_UNITS = 25000
 
 
 class DynamicSizer:

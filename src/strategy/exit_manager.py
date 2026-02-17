@@ -137,7 +137,7 @@ class ExitManagerConfig:
     )
 
     # Support/resistance
-    use_sr_exits: bool = True
+    use_sr_exits: bool = False
     sr_lookback: int = 50
 
     # Regime-based exits
