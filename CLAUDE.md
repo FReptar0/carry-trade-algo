@@ -6,6 +6,83 @@ Educational algorithmic trading system focused on forex carry trade strategies.
 Full system: synthetic data, strategy, backtest, optimization, real data, risk management, paper trading, regime detection, multi-timeframe analysis, exit optimization, validation, production operations, adaptive parameters, ML signal filtering, advanced risk management, and RL model lifecycle.
 No real money. Educational purposes only.
 
+## Validation Phase Overview
+
+**Status**: Code complete — in 34-day live validation protocol on OANDA practice account.
+**Goal**: Validate all components work in real market conditions before any real capital consideration.
+**Critical**: NO real money. OANDA practice account only. Educational purposes.
+
+### Trading Configuration (Live)
+- **Active Pairs**: USD/JPY, AUD/JPY, GBP/JPY, NZD/JPY, EUR/JPY, CAD/JPY
+- **Strategy**: V3 carry trade (hourly timeframe, 50/200 MA crossover + positive swap filter)
+- **Timeframe**: Hourly candles, ticks every hour
+- **Position Sizing**: ~4% per pair, ATR + Kelly + regime-aware via DynamicSizer
+- **Stop Loss**: ATR-based adaptive (2x ATR, ~2.9% distance), profit-scaled trailing
+- **Max Positions**: 6 (one per pair)
+- **Circuit Breakers**: Daily 3% loss, weekly 7%, max drawdown 20%
+
+### Data Quality Checks
+- [x] OANDA practice feed — real-time bid/ask, no simulated data
+- [x] 300 hourly candles per tick (12.5 days lookback)
+- [x] Realistic spreads (live broker spreads, not synthetic)
+- [x] No look-ahead bias (V3 uses only completed candles)
+- [x] Weekend/holiday handling (market hours detection, auto-pause)
+- [x] Timestamp synchronization (UTC throughout)
+
+### Strategy Validation
+- [x] Interest rate differential: swap rates fetched live from OANDA per pair
+- [x] Swap gate: positive swap required for entry (swap > 0)
+- [x] Entry signals: price > 50MA > 200MA (golden cross + trend confirmation)
+- [x] Exit logic: ATR stop, trailing stop, time-based, regime change
+- [x] Edge cases: news blackout (Forex Factory calendar), low liquidity sessions
+- [x] Walk-forward validated during Phase 3 optimization
+- [x] support_break exit bug found and disabled (Feb 13 audit)
+
+### Risk Management
+- [x] Position sizing scales with volatility (ATR-based DynamicSizer)
+- [x] Stop-loss levels ATR-based (adapts to current volatility)
+- [x] Drawdown-aware sizing: quadratic decay as DD increases
+- [x] Continuous vol scaling: trims positions when ATR spikes >1.5x entry ATR
+- [x] Portfolio correlation monitored (rolling pair correlation)
+- [x] Circuit breakers: daily/weekly loss limits, max drawdown 20%
+
+### Performance Thresholds (Protocol Abort/Warning)
+| Metric | Warning (DEGRADED) | Abort | Current |
+|--------|-------------------|-------|---------|
+| Max Drawdown | >10% | >15% | 0.0% |
+| Win Rate (active days) | <30% | <20% | N/A (waiting) |
+| Consecutive Losing Days | 3 | 5 | 0 |
+| Circuit Breaker Triggers | 2 | 3 | 0 |
+
+### Backtest Performance (V3, JPY pairs, 2023-2024 hourly)
+- Return: +5.18%
+- Max Drawdown: within limits
+- Walk-forward: validated in Phase 3
+- Note: CHF and EUR cross pairs tested and rejected (-17.48%, -12.77%)
+
+### Stress Testing Status
+Backtested against available OANDA historical data (2023-2024 hourly):
+- [x] Trending market (2023 JPY weakening)
+- [x] Ranging market (mid-2024 consolidation)
+- [ ] Major crisis scenario (insufficient historical depth for 2020/2008)
+- [ ] Flash crash / SNB-style event (not available in hourly data)
+- Note: Limited to ~2 years of hourly data from OANDA/yfinance
+
+### Success Criteria for Protocol Completion (Day 34)
+1. [x] Data quality: live OANDA feed, no gaps during market hours
+2. [x] Strategy logic: V3 validated, entry/exit rules documented
+3. [x] Risk management: all circuit breakers and sizing tested
+4. [ ] Performance: protocol must complete 34 days without abort
+5. [x] Error handling: graceful shutdown, state persistence, auto-recovery
+6. [x] Logging & monitoring: Telegram alerts, daily/weekly reports
+7. [x] Bug fixes documented: support_break audit, win rate calc fix
+
+### Telegram Commands (Live Monitoring)
+- `/status` — Equity, protocol day, positions, PnL
+- `/trends` — MA trend analysis per pair, gap to golden cross
+- `/positions` — Detailed per-pair breakdown
+- `/health` — Connectivity, uptime, last tick
+
 ## DFR Location
 Full design & functional requirements: `../dfr.md`
 
@@ -356,14 +433,21 @@ The support_break exit logic was designed for daily/weekly timeframes but was in
 2. Rapid entry/exit cycling (same pair entered 4x in one day)
 3. Cascading stop losses from poorly-timed re-entries
 
-## Current Live Status (as of 2026-02-14 22:00 UTC)
+## Current Live Status (as of 2026-02-16)
 
-- **Protocol Day**: 12 of 34 (started 2026-02-03, extended +4 days)
+- **Protocol Day**: 14 of 34 (started 2026-02-03, extended +4 days for bug period)
 - **Protocol Status**: RUNNING
 - **Equity**: $100,122.42 (restored to pre-bug level)
-- **Open Positions**: 0 (waiting for trend alignment)
-- **Market Status**: CLOSED (weekend - reopens Sun Feb 15 22:00 UTC)
-- **Fix Applied**: support_break exits disabled, balance restored
+- **Open Positions**: 0 (all pairs in downtrend, waiting for golden cross)
+- **Market Status**: OPEN
+- **Fixes Applied**: support_break exits disabled, balance restored, win rate calc fixed
+
+- **2026-02-16: Win rate calculation fix + /trends command** ✅
+  - Win rate check now only counts active trading days (days with trades or PnL)
+  - Flat days (no trades, $0 PnL) no longer drag down win rate
+  - Prevents false DEGRADED alerts when strategy is correctly sitting flat
+  - Added `/trends` Telegram command for MA trend analysis per pair
+  - Deployment note: `docker-compose up --build -d` required (not just restart)
 
 ## Why No Trades Are Happening (Feb 11-14)
 
