@@ -83,6 +83,136 @@ Backtested against available OANDA historical data (2023-2024 hourly):
 - `/positions` — Detailed per-pair breakdown
 - `/health` — Connectivity, uptime, last tick
 
+## Core Components (for onboarding new team members)
+
+### System Architecture Diagram
+```
+[CarryTradeStrategyV3] ← [Indicators] ← [OandaBroker/DataLoader]
+         ↓
+    [TradingRunner] ← Main orchestrator (hourly ticks)
+    ├→ [OandaBroker]         — OANDA v20 API (orders, candles, positions)
+    ├→ [ExitManager]         — Multi-condition exit logic
+    ├→ [DynamicSizer]        — ATR + Kelly + regime + DD-aware sizing
+    │   └← [CorrelationMonitor] — Rolling pair correlation
+    ├→ [RegimeDetector]      — ADX + ATR market regime classification
+    │   └→ [AdaptiveAdapter] ← [ParamStore] (Bayesian-tuned params)
+    ├→ [SignalBandit]        — ML signal gate (TAKE/SKIP)
+    │   └← [FeatureExtractor] + [ShadowEvaluator]
+    ├→ [CircuitBreaker]      — Kill switches (daily/weekly/DD limits)
+    ├→ [ScaleManager]        — Scale-in/out on winners
+    ├→ [PerformanceMonitor]  — Equity, drawdown, Sharpe tracking
+    ├→ [TradingProtocol]     — 34-day validation lifecycle
+    ├→ [StateStore]          — SQLite persistence (survives restarts)
+    ├→ [Reconciler]          — Broker ↔ internal position sync
+    ├→ [AlertManager]        — Telegram notifications
+    ├→ [TelegramBot]         — /status /trends /positions /health
+    └→ [Watchdog]            — Dead-man's-switch liveness monitor
+```
+
+### Strategy Layer (`src/strategy/`)
+
+**`carry_trade_v3.py`** — The active production strategy. Long-only trend-following carry trade on JPY pairs. Enters when `price > 50MA > 200MA` (golden cross) with positive swap. Uses wide 3x ATR stops to ride trends and accumulate swap income. This is the only strategy running live; V1, V2, V4 exist for historical comparison.
+
+**`exit_manager.py`** — Centralized exit decision engine. Evaluates 7 exit conditions per tick: stop-loss, trailing stop (profit-scaled at 4 levels), time-based (max hold period), profit target, support break (DISABLED due to bug), regime change, trend reversal. Returns `ExitSignal` with urgency level. The `ExitManagerConfig` is tuned per regime via the adaptive layer.
+
+**`indicators.py`** — Pure pandas/numpy technical indicators: SMA, RSI, ATR, ADX. No external TA library dependencies. Used by strategies, feature extraction, and the RL environment.
+
+**`base.py`** — Abstract `Strategy` class that all strategies inherit. Defines `Signal` enum (LONG/SHORT/CLOSE/HOLD) and `TradeSignal` dataclass. Any new strategy must implement `generate_signals(df) -> list[TradeSignal]`.
+
+### Data Layer (`src/data/`)
+
+**`loader.py`** — Downloads historical forex data from Yahoo Finance with parquet caching. Maps pair names (USD/JPY) to Yahoo ticker symbols. Returns standardized DataFrames with `timestamp, open, high, low, close, volume, swap_long, swap_short` columns. Used for backtesting only; live data comes from `OandaBroker.fetch_candles()`.
+
+**`preprocessor.py`** — Data quality validation: detects gaps, outliers, duplicates, weekend bars. Produces `DataQualityReport` with completeness percentage. `clean_data()` removes weekend bars, fills minor gaps, deduplicates. Run this before any backtest.
+
+**`multi_timeframe.py`** — Resamples hourly → weekly data without lookahead bias. Merges weekly context into hourly DataFrame for multi-timeframe strategies (V4). Aligns timestamps carefully to prevent future data leaking into signals.
+
+### Backtest Layer (`src/backtest/`)
+
+**`engine.py`** — Core backtesting engine. Replays historical data bar-by-bar, calls strategy's `generate_signals()`, executes via Portfolio, accrues swap, produces `BacktestResult` with full equity curve. Supports single-pair and multi-pair backtests.
+
+**`metrics.py`** — Computes all performance metrics from equity curve and trades: Sharpe, Sortino, Calmar, max drawdown, win rate, profit factor, plus carry-specific metrics (total_swap_profit, swap_contribution_pct). These are the same metrics used for protocol evaluation.
+
+**`portfolio.py`** — Trade ledger tracking cash, open `Position`s, and closed `Trade`s. Maintains equity curve, handles commissions and swap accrual. `get_equity()` returns cash + unrealized PnL at any point.
+
+### Risk Management Layer (`src/risk/`)
+
+**`dynamic_sizer.py`** — The production position sizer. Combines: Kelly criterion base size × ATR volatility factor × regime multiplier × correlation factor × drawdown quadratic decay. This is what actually determines how many units to trade. Connects to CorrelationMonitor and RegimeAdapter for context.
+
+**`circuit_breakers.py`** — Kill switches that halt ALL trading when limits are breached. Monitors: daily loss (3%), weekly loss (7%), max drawdown (20%), max positions (6), pair exposure. Returns `LimitViolation` with severity. Non-negotiable safety layer.
+
+**`stop_loss.py`** — ATR-based adaptive stops. Initial stop at 2-3x ATR below entry, then trailing stop that ratchets up with price. `update_trailing_stop()` called every tick. Connected to ExitManager.
+
+**`correlation.py`** — Rolling correlation matrix across all open pairs. When JPY pairs are highly correlated (they often are), `portfolio_correlation_factor()` returns <1.0 to reduce position sizes. Prevents over-concentration.
+
+**`scaling.py`** — Scale-in (add to winners at profit milestones) and scale-out (partial exits at ATR-multiple targets). Defines `ScaleLevel`s with ATR multiples and exit fractions.
+
+### Engine & Broker Layer (`src/engine/`, `src/broker/`)
+
+**`runner.py`** — The heart of the system. Orchestrates the hourly tick cycle: reconcile positions → check market hours → fetch candles → run strategy → evaluate exits → apply circuit breakers → place orders → persist state → update protocol. Uses APScheduler for cron-like scheduling. Handles graceful shutdown (SIGTERM), state recovery on restart, and all component wiring.
+
+**`market_hours.py`** — Forex session detector. Market opens Sunday 22:00 UTC, closes Friday 22:00 UTC. `is_market_open()` gates all trading. `next_open()` / `next_close()` used for scheduling and alerts.
+
+**`oanda.py`** — OANDA v20 REST API wrapper. Methods: `fetch_candles()`, `get_current_price()`, `submit_market_order()`, `submit_limit_order()`, `close_position()`, `get_account_state()`, `get_swap_rates()`. Includes 3-retry exponential backoff. `OandaConfig` holds credentials.
+
+**`simulator.py`** — Offline broker simulator for backtesting. Realistic slippage (0.5-2 pips), $7/lot commission, 50:1 leverage, margin tracking, swap accrual. Drop-in replacement for OandaBroker in test mode.
+
+### Validation Layer (`src/validation/`)
+
+**`protocol.py`** — The 34-day validation protocol. States: NOT_STARTED → RUNNING → DEGRADED → COMPLETED/ABORTED. Records `ProtocolDay` daily (equity, PnL, trades). Checks abort conditions: >15% drawdown, 5 consecutive losing days, 3 circuit breaker triggers, <20% win rate. Checkpoints at days 7, 14, 21, 30. Win rate calculation only counts active trading days (days with actual trades/PnL).
+
+**`validator.py`** — Compares backtest results vs live paper results. Checks degradation thresholds: 30% return degradation, 25% Sharpe degradation, 20% max drawdown increase. Validates execution quality (fill rates, slippage).
+
+### Operations Layer (`src/ops/`)
+
+**`alerts.py`** — Telegram alert dispatcher. Severity levels: INFO, WARNING, HIGH, CRITICAL. Throttles duplicate alerts. Sends on: trade entry/exit, circuit breaker triggers, protocol checkpoints, reconciliation mismatches, watchdog alerts, market open/close.
+
+**`telegram_bot.py`** — Interactive Telegram bot running in daemon thread (long-polling). Commands: `/status` (equity, positions, protocol), `/trends` (MA analysis per pair with gap-to-golden-cross), `/positions` (detailed per-pair), `/health` (uptime, connectivity). Only responds to authorized chat_id.
+
+**`watchdog.py`** — Liveness monitor. If no tick heartbeat within 2x expected interval, sends CRITICAL alert. Market-aware: suspends during weekends so closed-market silence doesn't trigger false alarms.
+
+**`reconciler.py`** — Syncs internal position tracking with OANDA broker state. Detects orphaned positions (broker has it, we don't track it), mismatched units, and ghost positions. Broker is source of truth.
+
+### Adaptive Layer (`src/adaptive/`)
+
+**`optimizer.py`** — Weekly Bayesian parameter optimization using Optuna. Runs walk-forward backtests on recent candles per regime, maximizing Sharpe ratio. Saves best parameters to ParamStore. Runs automatically every Sunday.
+
+**`param_store.py`** — SQLite-backed versioned parameter storage. Stores `ParamSet` records per regime with performance metrics (Sharpe, win_rate, sample_size). Supports active/inactive flags for A/B testing.
+
+**`adaptive_adapter.py`** — Extends RegimeAdapter to read Optuna-optimized parameters from ParamStore, falling back to hardcoded defaults if none exist. Drop-in replacement for static regime adaptation.
+
+### Machine Learning Layer (`src/ml/`)
+
+**`bandit.py`** — Thompson Sampling contextual bandit for signal filtering. Two arms: TAKE (execute signal) or SKIP (ignore). Uses Bayesian linear regression to learn which market contexts produce profitable signals. Updated after each trade completes.
+
+**`features.py`** — Extracts 14 market features at signal time: RSI, ATR ratio, MA spread, price vs 200MA, ADX, hour/day of week, regime code, swap rate, spread in bps, plus macro features (VIX, DXY, 10Y yield, S&P 500 change).
+
+**`shadow.py`** — Shadow evaluation mode where bandit logs decisions without blocking real signals. After minimum trades, computes bandit's advantage over random baseline. Auto-activates bandit when advantage exceeds threshold.
+
+### Reinforcement Learning Layer (`src/rl/`)
+
+**`environment.py`** — Gymnasium-compatible `TradingEnv`. Observation: 8 technical features. Actions: HOLD, ENTER_LONG, EXIT. Reward: equity change minus transaction costs. For offline RL agent training (PPO, DQN, etc.).
+
+**`registry.py`** — SQLite model version registry. Tracks model lifecycle: training → shadow → active → retired. Supports `promote()` and `rollback()` operations. Each version stores train/val/shadow Sharpe ratios.
+
+**`retraining.py`** — Automated weekly retraining pipeline. Trains bandit on recent trades, registers new version, shadow evaluates, auto-promotes if shadow outperforms active champion.
+
+### Regime Detection Layer (`src/regime/`)
+
+**`detector.py`** — Classifies market regime using ADX (trend strength) and ATR (volatility). Produces `CompositeRegime`: TREND_LOW_VOL (best for trading), TREND_HIGH_VOL (trade with caution), RANGE_LOW_VOL (avoid), RANGE_HIGH_VOL (do not trade).
+
+**`adapters.py`** — Maps CompositeRegime → strategy parameter adjustments. TREND_LOW_VOL: full size, relaxed entry. TREND_HIGH_VOL: 75% size, 2x stop. RANGE_LOW_VOL: 25% size, strict entry. RANGE_HIGH_VOL: no trading.
+
+### Monitoring & News (`src/monitoring/`, `src/news/`)
+
+**`performance.py`** — Real-time equity, drawdown, and rolling 30-day Sharpe tracking. Emits alerts on max drawdown and daily loss thresholds. Provides `PerformanceSnapshot` for Telegram bot and protocol evaluation.
+
+**`live_calendar.py`** — Fetches this week's high-impact economic events from Forex Factory (free JSON feed). Filters for USD, JPY, AUD, EUR currencies. Falls back to static JSON (`calendar.py`) if feed is unavailable. Used to skip entries during news volatility blackout windows.
+
+### Persistence (`src/persistence/`)
+
+**`store.py`** — SQLite state store with WAL mode for concurrent access. Tables: `protocol_state`, `daily_results`, `equity_snapshots`, `trade_log`, `checkpoints`, `position_states`. Survives container restarts. Runner loads full state on startup and persists every tick.
+
 ## DFR Location
 Full design & functional requirements: `../dfr.md`
 
