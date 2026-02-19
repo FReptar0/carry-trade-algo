@@ -622,13 +622,22 @@ Analyzed adding non-JPY pairs (CHF, EUR cross). Results:
 - Phase 3 (future): Short-side carry, ensemble strategies, deep RL
 
 ## Real Money Readiness (see docs/REAL_MONEY_READINESS.md)
-Full recommendations for transitioning from practice to real capital. Key items:
-- **Regime hard gate**: RANGE/RANGE_HIGH_VOL should BLOCK entries (currently only reduces size)
-- **Bandit threshold**: Lower min_trades 50 → 20 (current pace = 4-8 months to activate)
-- **Verify swap rates**: Confirm live OANDA swap rates fetched per tick, not defaults
-- **Drawdown recovery**: Define protocol for post-circuit-breaker resumption
-- **Second forward test**: 60-90 days clean before real money (need 50+ trades for stats)
-- **VIX/DXY gate**: Block entries when VIX > 25 (carry unwind signal)
-- **BOJ blackout**: 48h around BOJ meetings (not just ±2h generic blackout)
-- **Weekend gaps**: Close/halve positions before Friday 20:00 UTC
-- **Capital ladder**: Start $5-10k, scale only after 100+ trades and live Sharpe ≥ 70% of backtest
+
+### During protocol (days 14–34) — low-risk only
+- [x] **Weekend gap protection**: Close all positions Friday 20:00 UTC ✅ (2026-02-19)
+- [x] **Bandit threshold**: min_trades already set to 20 in runner.py:193 ✅
+- [x] **Verify swap rates**: Added WARNING log on fallback, DEBUG log on live fetch ✅ (2026-02-19)
+
+### After protocol day 34 — before second forward test
+- [x] **Regime hard gate**: runner.py:1082-1101 — RANGE_LOW/HIGH_VOL block entries ✅ (pre-existing)
+- [x] **Drawdown recovery protocol**: 15% DD halts entries, 10% DD caps size 50% ✅ (pre-existing)
+- [x] **VIX/DXY gate**: VIX > 25 blocks all pairs, DXY drop > 0.5% blocks USD/JPY ✅ (pre-existing)
+- [x] **BOJ blackout**: src/news/boj_calendar.py — ±24h, all 8 2026 dates ✅ (pre-existing)
+- [x] **Correlation hard cap**: >0.85 pairwise → block entry ✅ (2026-02-19)
+
+### After second forward test (60–90 days) — before real money
+- [ ] **50+ completed trades** on record for statistical significance
+- [ ] **Live Sharpe ≥ 70%** of backtest Sharpe
+- [ ] **Per-pair parameter optimization**: Run Optuna per pair, not per regime
+- [x] **Monthly review script**: scripts/monthly_review.py ✅ (2026-02-19)
+- [ ] **Capital ladder**: Start $5–10k, scale only after 100+ trades and DD never exceeded 10% live

@@ -923,9 +923,17 @@ class TradingRunner:
         if swap_rates and (swap_rates[0] != 0 or swap_rates[1] != 0):
             df["swap_long"] = swap_rates[0]
             df["swap_short"] = swap_rates[1]
+            logger.debug(
+                "Swap rates %s: long=%.6f short=%.6f (live)",
+                pair, swap_rates[0], swap_rates[1],
+            )
         else:
             df["swap_long"] = self.config.swap_long_default
             df["swap_short"] = self.config.swap_short_default
+            logger.warning(
+                "Swap rates %s: using defaults (long=%.6f short=%.6f) — live fetch returned %s",
+                pair, self.config.swap_long_default, self.config.swap_short_default, swap_rates,
+            )
 
         # Run strategy
         signals = self.strategy.generate_signals(df)
@@ -1091,6 +1099,21 @@ class TradingRunner:
                             regime_state.adx_value,
                         )
                         return
+
+            # Correlation hard cap: block entry when any open pair has rolling
+            # 60-day correlation > 0.85 with the candidate pair.
+            # At > 0.85 pairwise, the two positions are effectively the same
+            # trade with compounded leverage — no diversification benefit.
+            # Fail-open: get_correlation() returns 0.0 when matrix is unavailable.
+            open_pairs = list(self._strategy_positions.keys())
+            for open_pair in open_pairs:
+                corr = abs(self.correlation_monitor.get_correlation(open_pair, pair))
+                if corr > 0.85:
+                    logger.info(
+                        "Skipping entry for %s (correlation cap: corr=%.2f with %s > 0.85)",
+                        pair, corr, open_pair,
+                    )
+                    return
 
             # Phase C: Signal filter
             if self.config.enable_signal_filter:
