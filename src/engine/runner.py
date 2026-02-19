@@ -20,7 +20,8 @@ Tick workflow (every hour):
 6b. Check ExitManager for existing positions (time, regime, support,
     trend reversal, profit-scaled trailing — closes if triggered)
 7. Run V3 strategy on candle data
-7b. Regime gate (RANGE_LOW_VOL / RANGE_HIGH_VOL → block new entries)
+7b. DD recovery protocol gate (≥15% DD → block; 10-15% → cap size at 50%)
+7c. Regime gate (RANGE_LOW_VOL / RANGE_HIGH_VOL → block new entries)
 8. Run signal filter (bandit gate)
 9. Place limit order at bid (entries and scale-in)
 10. Check scale-in/scale-out for existing positions
@@ -225,6 +226,9 @@ class TradingRunner:
         self._trades_closed_today: int = 0
         self._max_drawdown_today: float = 0.0
         self._cb_triggered_today: bool = False
+        # Drawdown recovery protocol — tracks which alert levels have fired
+        # so we don't spam Telegram on every tick.  Cleared when DD recovers.
+        self._dd_alerted: set[str] = set()
 
         # Thread safety for bot access
         import threading
@@ -723,6 +727,30 @@ class TradingRunner:
         snapshot = self.monitor.get_snapshot()
         self._max_drawdown_today = max(self._max_drawdown_today, snapshot.drawdown)
 
+        # Drawdown recovery protocol — clear alerts when DD drops below thresholds
+        # so they can re-fire if DD worsens again in the future.
+        current_dd = snapshot.drawdown
+        if current_dd < 0.15 and "halt_15" in self._dd_alerted:
+            self._dd_alerted.discard("halt_15")
+            logger.info("DD recovered below 15%% (%.1f%%) — new entries re-enabled", current_dd * 100)
+            if self.alert_manager:
+                self.alert_manager.send(
+                    "INFO",
+                    "DD Recovery Protocol: Entries Resumed",
+                    f"Drawdown recovered to {current_dd:.1%} (below 15%%). "
+                    "New entries re-enabled.",
+                )
+        if current_dd < 0.10 and "caution_10" in self._dd_alerted:
+            self._dd_alerted.discard("caution_10")
+            logger.info("DD recovered below 10%% (%.1f%%) — full sizing restored", current_dd * 100)
+            if self.alert_manager:
+                self.alert_manager.send(
+                    "INFO",
+                    "DD Recovery Protocol: Full Sizing Restored",
+                    f"Drawdown recovered to {current_dd:.1%} (below 10%%). "
+                    "Position sizing back to normal.",
+                )
+
         # 10b. Check degraded conditions (RUNNING → DEGRADED)
         if self.protocol.status == ProtocolStatus.RUNNING and self.protocol.days:
             should_degrade, degrade_reason = self.protocol.check_degraded_conditions()
@@ -920,6 +948,26 @@ class TradingRunner:
                 logger.info("Skipping entry for %s (circuit breaker)", pair)
                 return
 
+            # Drawdown recovery protocol — graduated entry restrictions.
+            # 10–15% DD: allow entry but size will be capped in _open_position.
+            # ≥ 15% DD:   hard block — no new entries until DD recovers below 15%.
+            current_dd = self.monitor.get_snapshot().drawdown
+            if current_dd >= 0.15:
+                logger.info(
+                    "Skipping entry for %s (DD recovery protocol: %.1f%% >= 15%%)",
+                    pair, current_dd * 100,
+                )
+                if "halt_15" not in self._dd_alerted:
+                    self._dd_alerted.add("halt_15")
+                    if self.alert_manager:
+                        self.alert_manager.send(
+                            "HIGH",
+                            "DD Recovery Protocol: Entries Halted",
+                            f"Drawdown {current_dd:.1%} >= 15%%. "
+                            "No new entries until DD recovers below 15%%.",
+                        )
+                return
+
             # Regime gate: block entries in ranging or high-volatility regimes.
             # RANGE_LOW_VOL  → no clear direction, directional entry would be a gamble
             # RANGE_HIGH_VOL → worst regime: no direction + big swings = whipsaw
@@ -1043,6 +1091,28 @@ class TradingRunner:
             )
         else:
             units = self.config.position_size_units
+
+        # Drawdown recovery protocol: 10–15% DD → cap at 50% of base size.
+        # This sits on top of DynamicSizer's own quadratic decay so that at
+        # 10% DD the combined effect is clearly reduced, not just softly nudged.
+        current_dd = self.monitor.get_snapshot().drawdown
+        if 0.10 <= current_dd < 0.15:
+            dd_cap = max(1, int(self.config.position_size_units * 0.5))
+            if units > dd_cap:
+                logger.info(
+                    "DD protocol: capping units %d → %d (DD=%.1f%%)",
+                    units, dd_cap, current_dd * 100,
+                )
+                units = dd_cap
+            if "caution_10" not in self._dd_alerted:
+                self._dd_alerted.add("caution_10")
+                if self.alert_manager:
+                    self.alert_manager.send(
+                        "WARNING",
+                        "DD Recovery Protocol: Reduced Sizing",
+                        f"Drawdown {current_dd:.1%} >= 10%%. "
+                        "New position sizes capped at 50%% until DD recovers below 10%%.",
+                    )
 
         # Calculate broker-side stop-loss price (3x ATR below entry)
         atr_stop_mult = self.strategy.config.atr_stop_mult
