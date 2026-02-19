@@ -44,6 +44,7 @@ class CrossAssetData:
     Attributes:
         vix: CBOE Volatility Index.
         dxy: US Dollar Index.
+        dxy_prev_close: DXY previous day close (for daily change calc).
         us10y: US 10-Year Treasury yield.
         sp500: S&P 500 price.
         sp500_prev_close: S&P 500 previous close (for change calc).
@@ -53,6 +54,7 @@ class CrossAssetData:
 
     vix: float
     dxy: float
+    dxy_prev_close: float
     us10y: float
     sp500: float
     sp500_prev_close: float
@@ -122,10 +124,12 @@ class CrossAssetFetcher:
                 prev_closes[key] = prev_close
 
         sp500_prev = prev_closes.get("sp500", results["sp500"])
+        dxy_prev = prev_closes.get("dxy", results["dxy"])
 
         data = CrossAssetData(
             vix=results["vix"],
             dxy=results["dxy"],
+            dxy_prev_close=dxy_prev,
             us10y=results["us10y"],
             sp500=results["sp500"],
             sp500_prev_close=sp500_prev,

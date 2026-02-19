@@ -21,7 +21,8 @@ Tick workflow (every hour):
     trend reversal, profit-scaled trailing — closes if triggered)
 7. Run V3 strategy on candle data
 7b. DD recovery protocol gate (≥15% DD → block; 10-15% → cap size at 50%)
-7c. Regime gate (RANGE_LOW_VOL / RANGE_HIGH_VOL → block new entries)
+7c. Macro gate (VIX > 25 → block all; DXY daily drop > 0.5% → block USD/JPY)
+7d. Regime gate (RANGE_LOW_VOL / RANGE_HIGH_VOL → block new entries)
 8. Run signal filter (bandit gate)
 9. Place limit order at bid (entries and scale-in)
 10. Check scale-in/scale-out for existing positions
@@ -229,6 +230,8 @@ class TradingRunner:
         # Drawdown recovery protocol — tracks which alert levels have fired
         # so we don't spam Telegram on every tick.  Cleared when DD recovers.
         self._dd_alerted: set[str] = set()
+        # Macro gate — tracks fired alerts (VIX uses hysteresis; DXY keyed by date).
+        self._macro_alerted: set[str] = set()
 
         # Thread safety for bot access
         import threading
@@ -751,6 +754,23 @@ class TradingRunner:
                     "Position sizing back to normal.",
                 )
 
+        # Macro gate — clear VIX alert with hysteresis (fires >25, clears <23).
+        # DXY keys are date-stamped so they expire naturally each calendar day.
+        if "vix_high" in self._macro_alerted and self._cross_asset_fetcher is not None:
+            try:
+                macro = self._cross_asset_fetcher.get()
+                if not macro.is_default and macro.vix < 23.0:
+                    self._macro_alerted.discard("vix_high")
+                    logger.info("VIX recovered below 23 (%.1f) — macro gate cleared", macro.vix)
+                    if self.alert_manager:
+                        self.alert_manager.send(
+                            "INFO",
+                            "Macro Gate: VIX Cleared",
+                            f"VIX={macro.vix:.1f} < 23. New entries re-enabled.",
+                        )
+            except Exception:
+                pass
+
         # 10b. Check degraded conditions (RUNNING → DEGRADED)
         if self.protocol.status == ProtocolStatus.RUNNING and self.protocol.days:
             should_degrade, degrade_reason = self.protocol.check_degraded_conditions()
@@ -967,6 +987,61 @@ class TradingRunner:
                             "No new entries until DD recovers below 15%%.",
                         )
                 return
+
+            # Macro gate: block entries when global risk sentiment is hostile.
+            # Fail-open: if CrossAssetFetcher returns defaults (is_default=True),
+            # the fetch failed — allow entry rather than block on uncertainty.
+            #
+            # VIX > 25: risk-off globally → all JPY pairs unwind simultaneously.
+            #   Hysteresis: alert fires above 25, clears below 23 (avoids flip-flop).
+            #
+            # DXY daily drop > 0.5%: USD structurally weakening → USD/JPY headwind.
+            #   Applied to USD/JPY only (DXY is 57% EUR, less relevant for AUD/GBP etc.)
+            #   Keyed by calendar date so the gate resets each morning automatically.
+            if self._cross_asset_fetcher is not None:
+                try:
+                    macro = self._cross_asset_fetcher.get()
+                    if not macro.is_default:
+                        # VIX gate — all pairs
+                        if macro.vix > 25.0:
+                            logger.info(
+                                "Skipping entry for %s (macro gate: VIX=%.1f > 25)",
+                                pair, macro.vix,
+                            )
+                            if "vix_high" not in self._macro_alerted:
+                                self._macro_alerted.add("vix_high")
+                                if self.alert_manager:
+                                    self.alert_manager.send(
+                                        "HIGH",
+                                        "Macro Gate: VIX Elevated",
+                                        f"VIX={macro.vix:.1f} > 25. "
+                                        "Risk-off detected — blocking all new entries "
+                                        "until VIX drops below 23.",
+                                    )
+                            return
+
+                        # DXY gate — USD/JPY only
+                        if pair == "USD/JPY" and macro.dxy_prev_close > 0:
+                            dxy_chg = (macro.dxy - macro.dxy_prev_close) / macro.dxy_prev_close
+                            if dxy_chg < -0.005:
+                                logger.info(
+                                    "Skipping entry for %s (macro gate: DXY daily chg=%.2f%%)",
+                                    pair, dxy_chg * 100,
+                                )
+                                from datetime import date as _date
+                                dxy_key = f"dxy_weak_{_date.today()}"
+                                if dxy_key not in self._macro_alerted:
+                                    self._macro_alerted.add(dxy_key)
+                                    if self.alert_manager:
+                                        self.alert_manager.send(
+                                            "WARNING",
+                                            "Macro Gate: DXY Weakness",
+                                            f"DXY daily change={dxy_chg:.2%} (< -0.5%%). "
+                                            "USD selling detected — skipping USD/JPY entry today.",
+                                        )
+                                return
+                except Exception as e:
+                    logger.debug("Macro gate check failed (fail-open): %s", e)
 
             # Regime gate: block entries in ranging or high-volatility regimes.
             # RANGE_LOW_VOL  → no clear direction, directional entry would be a gamble
