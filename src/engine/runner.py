@@ -565,6 +565,16 @@ class TradingRunner:
             max_instances=1,
         )
 
+        # Weekend gap protection (Friday 20:00 UTC)
+        self.scheduler.add_job(
+            self._weekend_gap_close,
+            CronTrigger(day_of_week="fri", hour=20, minute=0, timezone=UTC),
+            id="weekend_gap_close",
+            name="Weekend Gap Protection",
+            max_instances=1,
+            misfire_grace_time=300,
+        )
+
         # Run initial tick
         self._tick()
 
@@ -2096,6 +2106,50 @@ class TradingRunner:
             tightened,
             failed,
             len(self._strategy_positions),
+        )
+
+    def _weekend_gap_close(self) -> None:
+        """Close all positions Friday 20:00 UTC to eliminate weekend gap risk.
+
+        Cost:    ~1 day of swap income (~$1-2 total across 6 pairs).
+        Benefit: eliminates gap exposure on $24k+ notional over the weekend.
+        Re-entry: normal tick Monday re-evaluates signals and re-opens if valid.
+        """
+        now = datetime.now(UTC)
+
+        if not self._strategy_positions:
+            logger.info("Weekend gap protection: no open positions")
+            return
+
+        pairs = list(self._strategy_positions.keys())
+        logger.info(
+            "Weekend gap protection: closing %d position(s): %s",
+            len(pairs), pairs,
+        )
+
+        closed, failed = [], []
+        for pair in pairs:
+            try:
+                self._close_position(pair, "weekend_gap_protection", now)
+                closed.append(pair)
+            except Exception as e:
+                failed.append(pair)
+                logger.error("Weekend gap: failed to close %s: %s", pair, e)
+
+        severity = "WARNING" if failed else "INFO"
+        body = (
+            f"Closed {len(closed)}/{len(pairs)} position(s) before weekend: "
+            f"{', '.join(closed) or 'none'}."
+        )
+        if failed:
+            body += f"\nFailed: {', '.join(failed)} — check manually."
+
+        if self.alert_manager:
+            self.alert_manager.send(severity, "Weekend Gap Protection", body)
+
+        logger.info(
+            "Weekend gap protection complete: %d closed, %d failed",
+            len(closed), len(failed),
         )
 
     def _close_all_positions(self, reason: str) -> None:
