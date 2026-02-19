@@ -1113,6 +1113,13 @@ class TradingRunner:
                         "Skipping entry for %s (correlation cap: corr=%.2f with %s > 0.85)",
                         pair, corr, open_pair,
                     )
+                    if self.alert_manager:
+                        self.alert_manager.send(
+                            "WARNING",
+                            "Correlation Cap Triggered",
+                            f"{pair} entry blocked: rolling correlation with {open_pair} "
+                            f"= {corr:.2f} > 0.85. Positions too correlated — no diversification benefit.",
+                        )
                     return
 
             # Phase C: Signal filter
@@ -1678,6 +1685,13 @@ class TradingRunner:
                         if should_activate:
                             self._bandit_active = True
                             logger.info("Bandit activated: %s", stats)
+                            if self.alert_manager:
+                                self.alert_manager.send(
+                                    "INFO",
+                                    "ML Bandit Activated",
+                                    f"Signal bandit is now live and filtering entries. "
+                                    f"Stats: {stats}",
+                                )
             except Exception as e:
                 logger.debug("Bandit update failed: %s", e)
 
