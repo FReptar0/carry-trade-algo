@@ -20,6 +20,7 @@ Tick workflow (every hour):
 6b. Check ExitManager for existing positions (time, regime, support,
     trend reversal, profit-scaled trailing — closes if triggered)
 7. Run V3 strategy on candle data
+7b. Regime gate (RANGE_LOW_VOL / RANGE_HIGH_VOL → block new entries)
 8. Run signal filter (bandit gate)
 9. Place limit order at bid (entries and scale-in)
 10. Check scale-in/scale-out for existing positions
@@ -185,7 +186,7 @@ class TradingRunner:
             cross_asset_fetcher=self._cross_asset_fetcher
         )
         self.bandit = SignalBandit(n_features=len(FEATURE_NAMES))
-        self.shadow_evaluator = ShadowEvaluator(min_trades=50, min_advantage=0.1)
+        self.shadow_evaluator = ShadowEvaluator(min_trades=20, min_advantage=0.1)
         self._bandit_active = False
         self._load_bandit_model()
 
@@ -918,6 +919,27 @@ class TradingRunner:
             if self.circuit_breaker.is_trading_halted:
                 logger.info("Skipping entry for %s (circuit breaker)", pair)
                 return
+
+            # Regime gate: block entries in ranging or high-volatility regimes.
+            # RANGE_LOW_VOL  → no clear direction, directional entry would be a gamble
+            # RANGE_HIGH_VOL → worst regime: no direction + big swings = whipsaw
+            # Fail-open: if detection fails (None), allow entry rather than block.
+            if df is not None:
+                regime_state = self._detect_regime_safe(df)
+                if regime_state is not None:
+                    from src.regime.detector import CompositeRegime
+                    blocked_regimes = (
+                        CompositeRegime.RANGE_LOW_VOL,
+                        CompositeRegime.RANGE_HIGH_VOL,
+                    )
+                    if regime_state.composite_regime in blocked_regimes:
+                        logger.info(
+                            "Skipping entry for %s (regime gate: %s, ADX=%.1f)",
+                            pair,
+                            regime_state.composite_regime.value,
+                            regime_state.adx_value,
+                        )
+                        return
 
             # Phase C: Signal filter
             if self.config.enable_signal_filter:

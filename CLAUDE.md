@@ -620,3 +620,15 @@ Analyzed adding non-JPY pairs (CHF, EUR cross). Results:
 - Phase 1 (best to have): Multi-pair ✅, limit orders ✅, drawdown-aware ✅, vol scaling ✅
 - Phase 2 (nice to have): Cross-asset signals, time-of-day seasonality, sentiment data
 - Phase 3 (future): Short-side carry, ensemble strategies, deep RL
+
+## Real Money Readiness (see docs/REAL_MONEY_READINESS.md)
+Full recommendations for transitioning from practice to real capital. Key items:
+- **Regime hard gate**: RANGE/RANGE_HIGH_VOL should BLOCK entries (currently only reduces size)
+- **Bandit threshold**: Lower min_trades 50 → 20 (current pace = 4-8 months to activate)
+- **Verify swap rates**: Confirm live OANDA swap rates fetched per tick, not defaults
+- **Drawdown recovery**: Define protocol for post-circuit-breaker resumption
+- **Second forward test**: 60-90 days clean before real money (need 50+ trades for stats)
+- **VIX/DXY gate**: Block entries when VIX > 25 (carry unwind signal)
+- **BOJ blackout**: 48h around BOJ meetings (not just ±2h generic blackout)
+- **Weekend gaps**: Close/halve positions before Friday 20:00 UTC
+- **Capital ladder**: Start $5-10k, scale only after 100+ trades and live Sharpe ≥ 70% of backtest
