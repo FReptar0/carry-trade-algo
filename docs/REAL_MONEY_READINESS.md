@@ -148,7 +148,7 @@ Do NOT mirror the practice account. Start small to validate execution quality on
 
 ### Before scaling beyond $10k
 - [ ] VIX/DXY macro filter implemented
-- [ ] BOJ meeting 48h blackout implemented
+- [x] BOJ meeting 48h blackout implemented
 - [ ] Weekend gap protection implemented
 - [ ] Live Sharpe ≥ 70% of backtest Sharpe
 - [ ] Correlation hard cap implemented

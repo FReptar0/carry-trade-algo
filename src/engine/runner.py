@@ -62,6 +62,7 @@ from src.ml.bandit import SignalBandit
 from src.ml.features import FEATURE_NAMES, FeatureExtractor
 from src.ml.shadow import ShadowEvaluator
 from src.monitoring.performance import PerformanceMonitor, TradeRecord
+from src.news.boj_calendar import BOJCalendar
 from src.news.calendar import EconomicCalendar
 from src.ops.alerts import AlertConfig, AlertManager
 from src.ops.reconciler import Reconciler
@@ -176,6 +177,7 @@ class TradingRunner:
         self._last_market_state: bool = True  # Track market open/close
         self._last_tick_time: Optional[datetime] = None  # For /health
         self.calendar = self._init_calendar()
+        self.boj_calendar = BOJCalendar(live_calendar=self.calendar)
         self.command_bot = self._init_command_bot()
 
         # Phase B: Adaptive parameters (loaded lazily)
@@ -479,6 +481,11 @@ class TradingRunner:
                 "System Startup",
                 f"Trading runner started with pairs: {self.config.pairs}",
             )
+
+        # Check BOJ calendar coverage for the current year
+        self.boj_calendar.check_year_coverage(
+            datetime.now(UTC).year, self.alert_manager
+        )
 
         # Register signal handlers for graceful shutdown
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -962,6 +969,17 @@ class TradingRunner:
 
             if in_blackout:
                 logger.info("Skipping entry for %s (blackout)", pair)
+                return
+
+            # BOJ meeting blackout: ±24h window around each BOJ decision day.
+            # Runs after the generic ±2h blackout so we add coverage for the
+            # 22h gap on either side.  Fail-open: only blocks if
+            # is_boj_blackout() returns True (never blocks on exception).
+            boj_blocked, boj_reason = self.boj_calendar.is_boj_blackout(now)
+            if boj_blocked:
+                logger.info(
+                    "Skipping entry for %s (BOJ blackout: %s)", pair, boj_reason
+                )
                 return
 
             if self.circuit_breaker.is_trading_halted:
