@@ -107,6 +107,11 @@ def main() -> None:
         initial_equity=initial_equity,
         log_dir=log_dir,
         db_path=db_path,
+        # OANDA practice account returns 0.0 for financing rates via API.
+        # Use small positive default so the carry gate (swap > 0) stays open.
+        # ~1.8%/yr annualized — conservative estimate for long JPY positions.
+        swap_long_default=0.00005,
+        swap_short_default=-0.0001,
     )
     runner = TradingRunner(broker, runner_config)
 

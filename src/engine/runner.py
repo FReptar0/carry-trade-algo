@@ -1590,6 +1590,22 @@ class TradingRunner:
                     pairs_to_remove.append(pair)
                     continue
 
+            # Scale-in special case: order filled while reconciler caught it.
+            # The reconciler already corrected position["units"]; we just need
+            # to increment tranche_count so ScaleManager doesn't re-scale.
+            if pending.get("is_scale_in", False) and pair in self._strategy_positions:
+                position = self._strategy_positions[pair]
+                old_tranche = position.get("tranche_count", 1)
+                position["tranche_count"] = old_tranche + 1
+                logger.info(
+                    "Scale-in for %s (order_id=%s) confirmed filled "
+                    "(reconciler-caught): tranche %d → %d, units=%d",
+                    pair, order_id, old_tranche, old_tranche + 1,
+                    position["units"],
+                )
+                pairs_to_remove.append(pair)
+                continue
+
             # Order not pending and no new trade — it was cancelled or
             # expired on the broker side
             logger.info(
