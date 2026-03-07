@@ -1,19 +1,21 @@
-"""30-day paper trading protocol for strategy validation.
+"""Multi-stage paper trading protocol for strategy validation.
 
 PROTOCOL PHILOSOPHY:
 ====================
-Paper trading for at least 30 days allows you to:
-1. See the strategy in different market conditions
-2. Verify execution works as expected
-3. Build confidence before real money
-4. Catch bugs and edge cases
+Paper trading across 3 stages (94 days) to gather enough data
+for statistical significance before real money.
+
+STAGES:
+=======
+Stage 1 (days 1-34):  Initial validation - does the strategy work?
+Stage 2 (days 35-64): Extended test - is the edge consistent?
+Stage 3 (days 65-94): Full validation - statistical proof of edge.
 
 CHECKPOINTS:
 ============
-Day 7:  Early sanity check - is anything obviously wrong?
-Day 14: Mid-point review - is performance tracking expectations?
-Day 21: Final stretch - any concerns before completion?
-Day 30: Final evaluation - pass/fail decision
+Stage 1: Days 7, 14, 21, 34 (end of stage)
+Stage 2: Days 44, 54, 64 (end of stage)
+Stage 3: Days 74, 84, 94 (end of stage, protocol complete)
 
 AUTO-ABORT CONDITIONS:
 ======================
@@ -145,11 +147,13 @@ class TradingProtocol:
         final = protocol.final_report()
     """
 
-    CHECKPOINT_DAYS = [7, 14, 21, 30]
+    CHECKPOINT_DAYS = [7, 14, 21, 34, 44, 54, 64, 74, 84, 94]
+    STAGE_BOUNDARIES = [34, 64, 94]
+    STAGE_NAMES = {1: "Initial Validation", 2: "Extended Test", 3: "Full Validation"}
 
     def __init__(
         self,
-        duration_days: int = 30,
+        duration_days: int = 94,
         abort_criteria: AbortCriteria | None = None,
         degraded_criteria: DegradedCriteria | None = None,
         recovery_criteria: RecoveryCriteria | None = None,
@@ -362,13 +366,13 @@ class TradingProtocol:
         """Run checkpoint analysis.
 
         Args:
-            day_num: Day number (7, 14, 21, or 30).
+            day_num: Checkpoint day number.
 
         Returns:
             ProtocolCheckpoint with analysis.
         """
         if day_num not in self.CHECKPOINT_DAYS:
-            raise ValueError(f"Invalid checkpoint day: {day_num}")
+            raise ValueError(f"Invalid checkpoint day: {day_num}. Valid: {self.CHECKPOINT_DAYS}")
 
         if len(self.days) < day_num:
             raise ValueError(f"Not enough days recorded for day {day_num} checkpoint")
@@ -494,9 +498,17 @@ class TradingProtocol:
         total_trades = sum(d.trades_closed for d in self.days)
         cb_triggers = sum(1 for d in self.days if d.circuit_breaker_triggered)
 
+        # Stage breakdowns
+        stages = {}
+        for s in (1, 2, 3):
+            sr = self.stage_report(s)
+            if sr.get("days", 0) > 0:
+                stages[f"stage_{s}"] = sr
+
         return {
             "status": self.status.value,
             "duration_days": len(self.days),
+            "current_stage": self.current_stage,
             "start_date": self.start_date.isoformat() if self.start_date else None,
             "end_date": self.end_date.isoformat() if self.end_date else None,
             "initial_equity": self.initial_equity,
@@ -508,6 +520,7 @@ class TradingProtocol:
             "total_trades": total_trades,
             "circuit_breaker_triggers": cb_triggers,
             "abort_reason": self.abort_reason,
+            "stages": stages,
             "checkpoints": [
                 {
                     "day": c.day,
@@ -536,6 +549,9 @@ class TradingProtocol:
         current_equity = self.days[-1].ending_equity
         current_return = (current_equity - self.initial_equity) / self.initial_equity
 
+        stage = self.current_stage
+        stage_name = self.STAGE_NAMES.get(stage, f"Stage {stage}")
+
         return {
             "status": self.status.value,
             "days_completed": len(self.days),
@@ -545,6 +561,81 @@ class TradingProtocol:
             "current_return": current_return,
             "next_checkpoint": self._next_checkpoint(),
             "degraded_reason": self.degraded_reason,
+            "stage": stage,
+            "stage_name": stage_name,
+        }
+
+    @property
+    def current_stage(self) -> int:
+        """Get current stage number (1, 2, or 3)."""
+        day_num = len(self.days)
+        if day_num <= 34:
+            return 1
+        elif day_num <= 64:
+            return 2
+        else:
+            return 3
+
+    def is_stage_boundary(self, day_num: int) -> bool:
+        """Check if a day number is a stage boundary."""
+        return day_num in self.STAGE_BOUNDARIES
+
+    def stage_report(self, stage: int) -> dict:
+        """Generate a report for a specific stage.
+
+        Args:
+            stage: Stage number (1, 2, or 3).
+
+        Returns:
+            Dictionary with stage-specific metrics.
+        """
+        stage_ranges = {1: (0, 34), 2: (34, 64), 3: (64, 94)}
+        start_idx, end_idx = stage_ranges.get(stage, (0, len(self.days)))
+        end_idx = min(end_idx, len(self.days))
+
+        if end_idx <= start_idx:
+            return {"stage": stage, "status": "not_started", "days": 0}
+
+        stage_days = self.days[start_idx:end_idx]
+
+        # Stage equity change
+        stage_start_equity = stage_days[0].starting_equity
+        stage_end_equity = stage_days[-1].ending_equity
+        stage_return = (stage_end_equity - stage_start_equity) / stage_start_equity
+
+        # Drawdown within stage
+        peak = stage_start_equity
+        max_dd = 0.0
+        for d in stage_days:
+            peak = max(peak, d.ending_equity)
+            dd = (peak - d.ending_equity) / peak
+            max_dd = max(max_dd, dd)
+
+        # Win rate (active days only)
+        active = [d for d in stage_days if d.trades_opened > 0 or d.trades_closed > 0 or d.daily_pnl != 0]
+        profitable = sum(1 for d in active if d.is_profitable)
+        win_rate = profitable / len(active) if active else 0.0
+
+        # Sharpe
+        returns = [d.daily_return for d in stage_days]
+        sharpe = 0.0
+        if len(returns) > 1 and np.std(returns) > 0:
+            sharpe = np.mean(returns) / np.std(returns) * np.sqrt(252)
+
+        total_trades = sum(d.trades_closed for d in stage_days)
+
+        return {
+            "stage": stage,
+            "stage_name": self.STAGE_NAMES.get(stage, f"Stage {stage}"),
+            "days": len(stage_days),
+            "start_equity": stage_start_equity,
+            "end_equity": stage_end_equity,
+            "return": stage_return,
+            "max_drawdown": max_dd,
+            "win_rate": win_rate,
+            "sharpe": sharpe,
+            "total_trades": total_trades,
+            "active_days": len(active),
         }
 
     def _next_checkpoint(self) -> Optional[int]:

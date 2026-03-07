@@ -299,6 +299,10 @@ class TradingRunner:
             "status": progress.get("status", "unknown"),
             "drawdown": snapshot.drawdown,
             "degraded_reason": getattr(self.protocol, "degraded_reason", None),
+            "stage": getattr(self.protocol, "current_stage", 1),
+            "stage_name": self.protocol.STAGE_NAMES.get(
+                getattr(self.protocol, "current_stage", 1), "Stage 1"
+            ),
         }
 
         # Positions with current prices from broker
@@ -440,22 +444,37 @@ class TradingRunner:
                 protocol.abort_reason = None
                 protocol.end_date = None
                 self.store.save_protocol_state(protocol)
-            else:
+
+            # Extend protocol to 94 days if it was using old duration
+            if protocol.duration < 94:
                 logger.info(
-                    "Restored protocol: day %d/%d, status=%s",
-                    len(protocol.days),
+                    "Extending protocol from %d to 94 days (3-stage validation)",
                     protocol.duration,
-                    protocol.status.value,
                 )
+                protocol.duration = 94
+                # Re-open if it was completed under old duration
+                if protocol.status == ProtocolStatus.COMPLETED:
+                    protocol.status = ProtocolStatus.RUNNING
+                    protocol.end_date = None
+                    logger.info("Re-opened completed protocol for stages 2-3")
+                self.store.save_protocol_state(protocol)
+
+            logger.info(
+                "Restored protocol: day %d/%d, stage %d, status=%s",
+                len(protocol.days),
+                protocol.duration,
+                protocol.current_stage,
+                protocol.status.value,
+            )
             return protocol
 
         protocol = TradingProtocol(
-            duration_days=30,
+            duration_days=94,
             initial_equity=self.config.initial_equity,
         )
         protocol.start()
         self.store.save_protocol_state(protocol)
-        logger.info("Created new 30-day protocol")
+        logger.info("Created new 94-day protocol (3 stages)")
         return protocol
 
     def start(self) -> None:
@@ -2832,11 +2851,37 @@ class TradingRunner:
                         f"Recommendation: {checkpoint.recommendation}",
                     )
 
-            # Check for protocol completion
+            # Check for stage boundary — log stage summary
+            if self.protocol.is_stage_boundary(day_num):
+                stage = self.protocol.current_stage
+                stage_rpt = self.protocol.stage_report(stage)
+                logger.info(
+                    "Stage %d complete: return=%.2f%%, sharpe=%.2f, "
+                    "trades=%d, win_rate=%.1f%%",
+                    stage,
+                    stage_rpt["return"] * 100,
+                    stage_rpt["sharpe"],
+                    stage_rpt["total_trades"],
+                    stage_rpt["win_rate"] * 100,
+                )
+                if self.alert_manager:
+                    self.alert_manager.send(
+                        "HIGH",
+                        f"Stage {stage} Complete (Day {day_num})",
+                        f"Stage: {stage_rpt['stage_name']}\n"
+                        f"Return: {stage_rpt['return']:.2%}\n"
+                        f"Sharpe: {stage_rpt['sharpe']:.2f}\n"
+                        f"Win Rate: {stage_rpt['win_rate']:.1%}\n"
+                        f"Trades: {stage_rpt['total_trades']}\n"
+                        f"Max DD: {stage_rpt['max_drawdown']:.2%}\n\n"
+                        f"Run validation suite for full analysis.",
+                    )
+
+            # Check for protocol completion (only at day 94)
             if day_num >= self.protocol.duration:
                 self.protocol.complete()
                 report = self.protocol.final_report()
-                logger.info("Protocol completed: %s", report)
+                logger.info("Protocol completed (all 3 stages): %s", report)
 
         # Send daily summary
         total_financing = sum(

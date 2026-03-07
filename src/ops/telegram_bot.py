@@ -223,7 +223,12 @@ class TelegramCommandBot:
             if status == "RUNNING"
             else "\u26a0\ufe0f"
         )
-        lines.append(f"{status_emoji} Day {day}/{duration} {status} | DD {dd:.1%}")
+        stage = proto.get("stage", 1)
+        stage_name = proto.get("stage_name", f"Stage {stage}")
+        lines.append(
+            f"{status_emoji} Day {day}/{duration} {status} "
+            f"| Stage {stage} ({stage_name}) | DD {dd:.1%}"
+        )
         if proto.get("degraded_reason"):
             lines.append(f"   \u26a0\ufe0f {proto['degraded_reason']}")
         lines.append("")
